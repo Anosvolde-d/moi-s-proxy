@@ -32,9 +32,9 @@ document.addEventListener('DOMContentLoaded', () => {
     
     // Initialize analytics
     fetchGlobalAnalytics();
-    
-    // Refresh analytics every 30 seconds
-    setInterval(fetchGlobalAnalytics, 30000);
+
+    // Refresh analytics every 3 seconds
+    setInterval(fetchGlobalAnalytics, 3000);
     
     // Check for API key in URL params
     const urlParams = new URLSearchParams(window.location.search);
