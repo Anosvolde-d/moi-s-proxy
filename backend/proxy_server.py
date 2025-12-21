@@ -1550,15 +1550,31 @@ async def get_public_stats():
         # Get analytics data (7 days default)
         analytics = await db.get_analytics(days=7)
         
+        # Extract totals from nested structure
+        totals = analytics.get("totals", {})
+        models = analytics.get("models", [])
+        
+        # Calculate success rate
+        total_requests = totals.get("total_requests", 0) or 0
+        successful_requests = totals.get("successful_requests", 0) or 0
+        success_rate = (successful_requests / total_requests * 100) if total_requests > 0 else 100.0
+        
+        # Get top model
+        top_model = models[0].get("model", "-") if models else "-"
+        
+        # Get active keys count
+        all_keys = await db.get_all_keys()
+        active_keys = sum(1 for k in all_keys if k.get("enabled", False))
+
         # Return only aggregated/public-safe data
         return {
-            "total_requests": analytics.get("total_requests", 0),
-            "success_rate": analytics.get("success_rate", 0),
-            "total_tokens": analytics.get("total_tokens", 0),
-            "input_tokens": analytics.get("input_tokens", 0),
-            "output_tokens": analytics.get("output_tokens", 0),
-            "top_model": analytics.get("top_model", "-"),
-            "active_keys": analytics.get("active_keys", 0)
+            "total_requests": total_requests,
+            "success_rate": round(success_rate, 1),
+            "total_tokens": totals.get("total_tokens", 0) or 0,
+            "input_tokens": totals.get("total_input_tokens", 0) or 0,
+            "output_tokens": totals.get("total_output_tokens", 0) or 0,
+            "top_model": top_model,
+            "active_keys": active_keys
         }
     except Exception as e:
         logger.error(f"Error fetching public stats: {e}")
