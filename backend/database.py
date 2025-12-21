@@ -13,44 +13,54 @@ import os
 logger = logging.getLogger(__name__)
 
 try:
-    import libsql_client
+    import libsql
     LIB_SQL_AVAILABLE = True
 except ImportError:
     LIB_SQL_AVAILABLE = False
-    logger.warning("libsql-client not installed. Turso support disabled.")
+    logger.warning("libsql not installed. Turso support disabled.")
 
 from config import config
 from contextlib import asynccontextmanager
 
 class CursorWrapper:
-    def __init__(self, result_set=None, cursor=None):
+    def __init__(self, result_set=None, cursor=None, is_sync=False):
         self._result_set = result_set
         self._cursor = cursor
+        self._is_sync = is_sync
         self._index = 0
         
     @property
     def rowcount(self):
         if self._cursor:
             return self._cursor.rowcount
-        # For Turso, we don't have a direct rowcount for non-selects in the same way via execute() result_set
-        # usually it's in result_set.rows_affected
-        return getattr(self._result_set, 'rows_affected', 0) if self._result_set else 0
+        # For libsql sync, rowcount is available on the result
+        if self._result_set:
+            return getattr(self._result_set, 'rowcount', 0)
+        return 0
 
     @property
     def lastrowid(self):
         if self._cursor:
             return self._cursor.lastrowid
-        return getattr(self._result_set, 'last_insert_rowid', None)
+        # For libsql sync, lastrowid is available on the result
+        if self._result_set:
+            return getattr(self._result_set, 'lastrowid', None)
+        return None
 
     async def fetchone(self):
         if self._cursor:
             row = await self._cursor.fetchone()
             return dict(row) if row else None
         
-        if self._result_set and self._index < len(self._result_set.rows):
-            row = self._result_set.rows[self._index]
-            self._index += 1
-            return dict(zip(self._result_set.columns, row))
+        # For libsql sync connection, fetchone returns a tuple
+        if self._result_set:
+            row = self._result_set.fetchone()
+            if row:
+                # Convert tuple to dict using description
+                if hasattr(self._result_set, 'description') and self._result_set.description:
+                    columns = [col[0] for col in self._result_set.description]
+                    return dict(zip(columns, row))
+                return row
         return None
 
     async def fetchall(self):
@@ -58,14 +68,19 @@ class CursorWrapper:
             rows = await self._cursor.fetchall()
             return [dict(row) for row in rows]
         
+        # For libsql sync connection, fetchall returns list of tuples
         if self._result_set:
-            return [dict(zip(self._result_set.columns, row)) for row in self._result_set.rows]
+            rows = self._result_set.fetchall()
+            if rows and hasattr(self._result_set, 'description') and self._result_set.description:
+                columns = [col[0] for col in self._result_set.description]
+                return [dict(zip(columns, row)) for row in rows]
+            return rows if rows else []
         return []
 
 class ConnectionWrapper:
     def __init__(self, conn=None, client=None):
-        self._conn = conn
-        self._client = client
+        self._conn = conn  # aiosqlite async connection
+        self._client = client  # libsql sync connection
         
     @property
     def row_factory(self):
@@ -78,19 +93,20 @@ class ConnectionWrapper:
 
     async def execute(self, sql, params=None):
         if self._conn:
-            # aiosqlite connection
+            # aiosqlite async connection
             cursor = await self._conn.execute(sql, params or ())
             return CursorWrapper(cursor=cursor)
         else:
-            # libsql client
-            # libsql-client uses '?' or ':' for parameters
-            result_set = await self._client.execute(sql, params or ())
-            return CursorWrapper(result_set=result_set)
+            # libsql sync connection - call synchronously
+            result = self._client.execute(sql, params or ())
+            return CursorWrapper(result_set=result, is_sync=True)
             
     async def commit(self):
         if self._conn:
             await self._conn.commit()
-        # libsql client commits automatically or via transactions
+        elif self._client:
+            # libsql sync connection
+            self._client.commit()
 
     async def close(self):
         if self._conn:
@@ -116,8 +132,15 @@ class Database:
     @asynccontextmanager
     async def get_db(self):
         if self.use_turso:
-            async with libsql_client.create_client(config.TURSO_DATABASE_URL, config.TURSO_AUTH_TOKEN) as client:
-                yield ConnectionWrapper(client=client)
+            # Use libsql package for Turso connection
+            conn = libsql.connect(
+                config.TURSO_DATABASE_URL,
+                auth_token=config.TURSO_AUTH_TOKEN
+            )
+            try:
+                yield ConnectionWrapper(client=conn)
+            finally:
+                conn.close()
         else:
             async with aiosqlite.connect(self.db_path) as db:
                 db.row_factory = aiosqlite.Row
@@ -126,9 +149,18 @@ class Database:
     def init_db(self):
         """Initialize database with required tables"""
         if self.use_turso:
-            # For Turso, we'll run initialization asynchronously on first use or provided script
-            # To keep it simple, we'll add a helper that can be called
-            logger.info("Turso detected. Skipping synchronous init_db. Ensure tables exist.")
+            # For Turso, use libsql synchronous connection
+            logger.info("Initializing Turso database tables...")
+            try:
+                conn = libsql.connect(
+                    config.TURSO_DATABASE_URL,
+                    auth_token=config.TURSO_AUTH_TOKEN
+                )
+                self._init_tables(conn)
+                conn.close()
+                logger.info("Turso database tables initialized successfully")
+            except Exception as e:
+                logger.error(f"Failed to initialize Turso database: {e}")
             return
 
         # Ensure the directory exists again just in case
@@ -137,6 +169,11 @@ class Database:
             os.makedirs(db_dir, exist_ok=True)
             
         conn = sqlite3.connect(self.db_path)
+        self._init_tables(conn)
+        conn.close()
+    
+    def _init_tables(self, conn):
+        """Initialize tables on the given connection (works with both sqlite3 and libsql)"""
         cursor = conn.cursor()
         
         # Create api_keys table
@@ -443,7 +480,6 @@ class Database:
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_large_context_time ON large_context_logs(request_time)')
         
         conn.commit()
-        conn.close()
     
     def generate_api_key(self) -> tuple[str, str]:
         """Generate a new API key and return (key, prefix)"""
