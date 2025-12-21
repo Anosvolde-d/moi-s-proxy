@@ -104,7 +104,7 @@ body {
     position: fixed;
     inset: 0;
     pointer-events: none;
-    z-index: 0;
+    z-index: 1;
     overflow: hidden;
 }
 
@@ -233,34 +233,61 @@ body {
 }
 
 /* ===================================
-   Banner Section
+   Banner Section - Animated Color Glow
    =================================== */
 
 .banner-section {
     position: relative;
     z-index: 10;
-    display: flex;
-    justify-content: center;
-    align-items: center;
     width: 100%;
-    padding: 2rem 0;
-    margin-top: 1rem;
+    max-width: 900px;
+    margin: 1rem auto 0 auto;
+    padding: 0 2rem;
+    text-align: center;
 }
 
 .banner-image {
-    max-width: 90%;
-    max-height: 250px;
+    display: block;
+    max-width: 100%;
+    max-height: 200px;
     width: auto;
     height: auto;
+    margin: 0 auto;
     object-fit: contain;
     border-radius: 12px;
-    box-shadow: 0 0 30px rgba(255, 215, 0, 0.3), 0 0 60px rgba(255, 215, 0, 0.1);
-    transition: all 0.3s ease;
+    border: 2px solid transparent;
+    animation: bannerGlow 6s ease-in-out infinite;
 }
 
-.banner-image:hover {
-    transform: scale(1.02);
-    box-shadow: 0 0 40px rgba(255, 215, 0, 0.4), 0 0 80px rgba(255, 215, 0, 0.2);
+/* Animated color-changing glow for banner */
+@keyframes bannerGlow {
+    0%, 100% {
+        /* Light Cyan Blue */
+        border-color: #00e5ff;
+        box-shadow:
+            0 0 10px #00e5ff,
+            0 0 20px rgba(0, 229, 255, 0.5),
+            0 0 30px rgba(0, 229, 255, 0.3),
+            0 0 40px rgba(0, 229, 255, 0.2);
+    }
+    33% {
+        /* Pink / Light Rose (Red) */
+        border-color: #ff4d6d;
+        box-shadow:
+            0 0 10px #ff4d6d,
+            0 0 20px rgba(255, 77, 109, 0.5),
+            0 0 30px rgba(255, 77, 109, 0.3),
+            0 0 40px rgba(255, 77, 109, 0.2);
+    }
+    66% {
+        /* Purple */
+        border-color: #a855f7;
+        box-shadow:
+            0 0 10px #a855f7,
+            0 0 20px rgba(168, 85, 247, 0.5),
+            0 0 30px rgba(168, 85, 247, 0.3),
+            0 0 40px rgba(168, 85, 247, 0.2);
+    }
 }
 
 /* ===================================
