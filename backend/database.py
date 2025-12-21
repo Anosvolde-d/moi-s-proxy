@@ -13,11 +13,12 @@ import os
 logger = logging.getLogger(__name__)
 
 try:
-    import libsql
+    import libsql_experimental as libsql
     LIB_SQL_AVAILABLE = True
+    logger.info("libsql_experimental loaded successfully")
 except ImportError:
     LIB_SQL_AVAILABLE = False
-    logger.warning("libsql not installed. Turso support disabled.")
+    logger.warning("libsql_experimental not installed. Turso support disabled. Install with: pip install libsql-experimental")
 
 from config import config
 from contextlib import asynccontextmanager
