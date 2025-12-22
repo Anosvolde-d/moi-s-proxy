@@ -510,7 +510,7 @@ class Database:
             backup_dir = Path("backups")
             backup_dir.mkdir(exist_ok=True)
             
-            if self.use_turso:
+            if self.turso_available:
                 # For Turso, we could perform a remote dump if supported, 
                 # but a simple way is to fetch critical tables and save locally as json or sqlite
                 logger.info(f"Starting Turso backup to local file...")
@@ -959,7 +959,7 @@ class Database:
                 return info
         
         async with self.get_db() as db:
-            if not self.use_turso:
+            if not self.turso_available:
                 db.row_factory = aiosqlite.Row
                 
             cursor = await db.execute('''
@@ -1340,7 +1340,7 @@ class Database:
                 return costs
                 
         async with self.get_db() as db:
-            if not self.use_turso:
+            if not self.turso_available:
                 db.row_factory = aiosqlite.Row
             cursor = await db.execute('SELECT * FROM model_costs ORDER BY model_pattern ASC')
             rows = await cursor.fetchall()
