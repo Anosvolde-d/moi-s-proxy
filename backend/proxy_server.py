@@ -856,27 +856,20 @@ async def forward_streaming_request(client_request: Dict[str, Any], api_key_id: 
                                                             safe_to_stream = airforce_tail_buffer[:-AIRFORCE_TAIL_SIZE]
                                                             airforce_tail_buffer = airforce_tail_buffer[-AIRFORCE_TAIL_SIZE:]
                                                             
-                                                            for char in safe_to_stream:
-                                                                char_data = {
+                                                            # Stream safe content immediately without character splitting or delays
+                                                            if safe_to_stream:
+                                                                chunk_data = {
                                                                     "id": data.get("id", ""),
                                                                     "object": "chat.completion.chunk",
                                                                     "created": data.get("created", 0),
                                                                     "model": data.get("model", ""),
-                                                                    "choices": [{"index": 0, "delta": {"content": char}, "finish_reason": None}]
+                                                                    "choices": [{"index": 0, "delta": {"content": safe_to_stream}, "finish_reason": None}]
                                                                 }
-                                                                yield f"data: {json.dumps(char_data)}\n\n"
-                                                                await asyncio.sleep(char_delay)
+                                                                yield f"data: {json.dumps(chunk_data)}\n\n"
                                                     else:
-                                                        for char in content:
-                                                            char_data = {
-                                                                "id": data.get("id", ""),
-                                                                "object": "chat.completion.chunk",
-                                                                "created": data.get("created", 0),
-                                                                "model": data.get("model", ""),
-                                                                "choices": [{"index": 0, "delta": {"content": char}, "finish_reason": None}]
-                                                            }
-                                                            yield f"data: {json.dumps(char_data)}\n\n"
-                                                            await asyncio.sleep(char_delay)
+                                                        # Direct streaming for non-Airforce providers
+                                                        yield f"data: {json.dumps(data)}\n\n"
+
                                                     
                                                     if 'usage' in data:
                                                         usage = data['usage']
