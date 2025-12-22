@@ -164,9 +164,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Add GZip Middleware (configured to avoid buffering small streams)
-# Setting minimum_size to 1000 bytes prevents gzip from buffering very small chunks
-app.add_middleware(GZipMiddleware, minimum_size=1000)
+# GZip Middleware removed as it causes buffering issues with streaming on Zeabur/Nginx
+# app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 @app.middleware("http")
 async def add_no_buffering_header(request: Request, call_next):
@@ -178,6 +177,7 @@ async def add_no_buffering_header(request: Request, call_next):
         response.headers["Cache-Control"] = "no-cache, no-transform"
         response.headers["Connection"] = "keep-alive"
         response.headers["X-No-Buffering"] = "1" # Extra hint for some proxies
+        response.headers["X-Content-Type-Options"] = "nosniff" # Prevent content sniffing buffering
         # Ensure transfer-encoding is chunked (usually handled by FastAPI/Starlette)
     return response
 
