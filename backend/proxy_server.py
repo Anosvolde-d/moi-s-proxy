@@ -96,12 +96,10 @@ async def startup_event():
     # Initialize Turso client (requires running event loop)
     await db.init_turso_client()
     
-    # Load data from Turso (once on startup)
+    # Load data from Turso (once on startup - for persistence across restarts)
     await db.load_from_turso()
     
-    # Start background sync task for Turso
-    await db.start_sync_task()
-
+    # NOTE: No real-time sync - only hourly full backup to Turso for speed
     
     if config.KEEP_ALIVE_ENABLED:
         _keep_alive_task = asyncio.create_task(keep_alive_ping())
@@ -109,9 +107,10 @@ async def startup_event():
     else:
         logger.info("Keep-alive background task disabled")
         
-    # Start hourly sync task (replaces backup task)
+    # Start hourly full backup to Turso (no real-time sync for speed)
     _backup_task = asyncio.create_task(hourly_sync_task())
-    logger.info("Hourly Turso sync background task started")
+    logger.info("Hourly Turso backup task started")
+
 
 @app.on_event("shutdown")
 async def shutdown_event():
