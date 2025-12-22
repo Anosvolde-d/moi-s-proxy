@@ -1201,23 +1201,32 @@ async def chat_completions(request: Request):
             )
             raise HTTPException(status_code=429, detail=rate_limit_check["error"])
             
-        # Check Total Token Quota
+        # Check Total Token Quota (daily limit)
         if key_info["max_total_tokens"] is not None:
             if key_info["total_tokens_used"] >= key_info["max_total_tokens"]:
-                await broadcast_log(f"Quota exceeded for key {key_info['prefix']}: {key_info['total_tokens_used']} / {key_info['max_total_tokens']}", "WARNING")
-                raise HTTPException(status_code=403, detail="API key token quota exceeded")
+                await broadcast_log(f"Daily token limit exceeded for key {key_info['prefix']}: {key_info['total_tokens_used']} / {key_info['max_total_tokens']} (IP: {client_ip})", "WARNING")
+                raise HTTPException(status_code=403, detail="sorry, daily token limit exceeded")
         
         # Parse request body
         body = await request.json()
         
-        # Check Context Limit
+        # Check Context Limit (per-request)
         if key_info["max_context_tokens"] is not None:
             # Estimate tokens in the request
             request_text = json.dumps(body.get("messages", []))
             estimated_input = estimate_tokens(request_text)
             if estimated_input > key_info["max_context_tokens"]:
-                await broadcast_log(f"Context limit exceeded for key {key_info['prefix']}: {estimated_input} > {key_info['max_context_tokens']}", "WARNING")
-                raise HTTPException(status_code=400, detail=f"Request exceeds max context limit of {key_info['max_context_tokens']} tokens")
+                await broadcast_log(f"Context limit exceeded for key {key_info['prefix']}: {estimated_input} > {key_info['max_context_tokens']} (IP: {client_ip})", "WARNING")
+                # Log to high context log with IP, key, and tokens
+                await db.log_large_context(
+                    key_info["id"],
+                    body.get("model", "unknown"),
+                    input_tokens=estimated_input,
+                    output_tokens=0,
+                    total_tokens=estimated_input,
+                    client_ip=client_ip
+                )
+                raise HTTPException(status_code=400, detail="i have your ip, you little context eater")
 
         # Security Check: Jailbreak Protection
         is_jailbreak, jb_error = jailbreak_check(body.get("messages", []))
