@@ -2066,46 +2066,6 @@ async def delete_model_cost(cost_id: int):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# Export endpoint
-@app.get("/admin/export", dependencies=[Depends(verify_admin)])
-async def export_data():
-    """
-    Export all data: Keys, Analytics, Costs, Settings.
-    Includes model prices per token and analytics.
-    """
-    try:
-        # Get all keys
-        keys = await db.get_all_keys()
-        
-        # Get analytics (last 30 days)
-        analytics = await db.get_analytics(days=30)
-        
-        # Get model costs
-        costs = await db.get_model_costs()
-        
-        # Get WebScrapingAPI settings
-        ws_settings = {
-            "enabled": config.WEBSCRAPINGAPI_ENABLED,
-            "has_key": bool(config.WEBSCRAPINGAPI_KEY)
-        }
-        
-        export_data = {
-            "timestamp": datetime.now().isoformat(),
-            "keys": keys,
-            "analytics": analytics,
-            "model_costs": costs,
-            "settings": {
-                "webscraping_api": ws_settings,
-                "sync_interval": config.SYNC_INTERVAL,
-                "keep_alive_interval": config.KEEP_ALIVE_INTERVAL
-            }
-        }
-        
-        return export_data
-    except Exception as e:
-        await broadcast_log(f"Error exporting data: {str(e)}", "ERROR")
-        raise HTTPException(status_code=500, detail=str(e))
-
 # WebSocket endpoint for real-time logs
 @app.websocket("/admin/logs/stream")
 async def websocket_logs(websocket: WebSocket):
@@ -2621,9 +2581,22 @@ async def scheduled_refresh_task():
 # Admin Export/Import Endpoints
 @app.get("/admin/export")
 async def export_database(admin: str = Depends(verify_admin)):
-    """Export the full database to a JSON file"""
+    """
+    Export the full database to a JSON file.
+    Structure matches db.import_data requirements.
+    """
     try:
         data = await db.export_data()
+        
+        # Enhance with extra info for readability (optional metadata)
+        data["metadata"] = {
+            "analytics_summary": await db.get_analytics(days=30),
+            "settings": {
+                "sync_interval": config.SYNC_INTERVAL,
+                "keep_alive_enabled": config.KEEP_ALIVE_ENABLED
+            }
+        }
+        
         filename = f"db_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
         
         return JSONResponse(
@@ -2632,6 +2605,7 @@ async def export_database(admin: str = Depends(verify_admin)):
         )
     except Exception as e:
         logger.error(f"Export failed: {e}")
+        await broadcast_log(f"Export failed: {e}", "ERROR")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/admin/import")
