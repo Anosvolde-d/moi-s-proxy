@@ -914,6 +914,13 @@ class Database:
             ''', (key_id, current_minute, current_day))
             await db.commit()
         
+        # Queue sync to Turso for persistence across restarts
+        self.queue_turso_sync('''
+            INSERT OR REPLACE INTO api_keys (id, key_hash, key_prefix, name, max_rpm, max_rpd, enabled, target_url, target_api_key, no_auth, use_proxy, model_mappings, expires_at, ip_whitelist, ip_blacklist, providers, provider_rotation_index, provider_rotation_frequency, disable_model_fetch, http_referer, max_total_tokens, max_context_tokens, custom_prefills, budget_limit, budget_used, budget_reset_date)
+            VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+        ''', (key_id, key_hash, prefix, name, max_rpm, max_rpd, target_url, target_api_key, 1 if no_auth else 0, 1 if use_proxy else 0, model_mappings, expires_at, ip_whitelist, ip_blacklist, providers, provider_rotation_frequency, 1 if disable_model_fetch else 0, http_referer, max_total_tokens, max_context_tokens, custom_prefills, budget_limit, budget_reset_date))
+
+        
         return {
             "id": key_id,
             "api_key": api_key,  # Only return once during creation
@@ -1271,7 +1278,7 @@ class Database:
         
         async with self.get_db() as db:
             # Insert usage log with cost and cache hit info
-            await db.execute('''
+            cursor = await db.execute('''
                 INSERT INTO usage_logs (api_key_id, model, tokens_used, input_tokens, output_tokens, success, is_cache_hit, error_message, client_ip, cost)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (api_key_id, model, tokens_used, input_tokens, output_tokens, success, 1 if is_cache_hit else 0, error_message, client_ip, cost))
@@ -1285,6 +1292,19 @@ class Database:
                 ''', (tokens_used, api_key_id))
             
             await db.commit()
+        
+        # Queue sync to Turso for analytics persistence
+        self.queue_turso_sync('''
+            INSERT INTO usage_logs (api_key_id, model, tokens_used, input_tokens, output_tokens, success, is_cache_hit, error_message, client_ip, cost)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (api_key_id, model, tokens_used, input_tokens, output_tokens, success, 1 if is_cache_hit else 0, error_message, client_ip, cost))
+        
+        # Also sync the token update for the key
+        if success and tokens_used > 0:
+            self.queue_turso_sync('''
+                UPDATE api_keys SET total_tokens_used = total_tokens_used + ? WHERE id = ?
+            ''', (tokens_used, api_key_id))
+
 
     async def calculate_cost(self, model: str, input_tokens: int, output_tokens: int) -> float:
         """Calculate cost based on model patterns from model_costs table"""
