@@ -304,6 +304,27 @@
                 </div>
             </section>
 
+            <!-- Data Management Section -->
+            <section class="glass-card">
+                <div class="section-header">
+                    <h2><span class="icon">💾</span> Data Management</h2>
+                </div>
+                <div class="form-group" style="padding: 0 1rem 1rem;">
+                    <p class="form-hint" style="margin-bottom: 1rem;">Backup or restore the entire database (API keys,
+                        logs, costs).</p>
+                    <div style="display: flex; gap: 10px;">
+                        <button class="btn btn-primary" onclick="exportData()">
+                            ⬇️ Download Backup
+                        </button>
+                        <label class="btn btn-secondary" style="cursor: pointer; position: relative;">
+                            ⬆️ Upload Restore File
+                            <input type="file" id="importFile" onchange="importData(this)" style="display: none;"
+                                accept=".json">
+                        </label>
+                    </div>
+                </div>
+            </section>
+
             <!-- Real-time Console Section -->
             <section class="glass-card">
                 <div class="console-container">
