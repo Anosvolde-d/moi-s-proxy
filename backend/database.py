@@ -13,12 +13,12 @@ import os
 logger = logging.getLogger(__name__)
 
 try:
-    import libsql_experimental as libsql
+    import libsql_client
     LIB_SQL_AVAILABLE = True
-    logger.info("libsql_experimental loaded successfully")
+    logger.info("libsql_client loaded successfully")
 except ImportError:
     LIB_SQL_AVAILABLE = False
-    logger.warning("libsql_experimental not installed. Turso support disabled. Install with: pip install libsql-experimental")
+    logger.warning("libsql_client not installed. Turso support disabled. Install with: pip install libsql-client")
 
 from config import config
 from contextlib import asynccontextmanager
@@ -53,15 +53,12 @@ class CursorWrapper:
             row = await self._cursor.fetchone()
             return dict(row) if row else None
         
-        # For libsql sync connection, fetchone returns a tuple
-        if self._result_set:
-            row = self._result_set.fetchone()
-            if row:
-                # Convert tuple to dict using description
-                if hasattr(self._result_set, 'description') and self._result_set.description:
-                    columns = [col[0] for col in self._result_set.description]
-                    return dict(zip(columns, row))
-                return row
+        # For libsql-client, result_set is the result of execute()
+        if self._result_set and self._result_set.rows:
+            if self._index < len(self._result_set.rows):
+                row = self._result_set.rows[self._index]
+                self._index += 1
+                return dict(zip(self._result_set.columns, row))
         return None
 
     async def fetchall(self):
@@ -69,13 +66,10 @@ class CursorWrapper:
             rows = await self._cursor.fetchall()
             return [dict(row) for row in rows]
         
-        # For libsql sync connection, fetchall returns list of tuples
-        if self._result_set:
-            rows = self._result_set.fetchall()
-            if rows and hasattr(self._result_set, 'description') and self._result_set.description:
-                columns = [col[0] for col in self._result_set.description]
-                return [dict(zip(columns, row)) for row in rows]
-            return rows if rows else []
+        # For libsql-client
+        if self._result_set and self._result_set.rows:
+            columns = self._result_set.columns
+            return [dict(zip(columns, row)) for row in self._result_set.rows]
         return []
 
 class ConnectionWrapper:
@@ -98,81 +92,464 @@ class ConnectionWrapper:
             cursor = await self._conn.execute(sql, params or ())
             return CursorWrapper(cursor=cursor)
         else:
-            # libsql sync connection - call synchronously
-            result = self._client.execute(sql, params or ())
-            return CursorWrapper(result_set=result, is_sync=True)
+            # libsql-client async execution
+            result = await self._client.execute(sql, params or ())
+            return CursorWrapper(result_set=result)
             
     async def commit(self):
         if self._conn:
             await self._conn.commit()
-        elif self._client:
-            # libsql sync connection
-            self._client.commit()
+        # libsql-client handles commits implicitly or via transactions which we are not using here for simplicity
 
     async def close(self):
         if self._conn:
             await self._conn.close()
-        # client is closed by the context manager
 
 class Database:
     def __init__(self, db_path: str = None):
-        self.use_turso = LIB_SQL_AVAILABLE and bool(config.TURSO_DATABASE_URL)
+        self.turso_available = LIB_SQL_AVAILABLE and bool(config.TURSO_DATABASE_URL)
         self.db_path = db_path or config.DATABASE_PATH
+        self._turso_client = None
         
-        if self.use_turso:
-            logger.info(f"Using Turso database at {config.TURSO_DATABASE_URL}")
-        else:
-            # Ensure the directory exists for local SQLite
-            db_dir = os.path.dirname(self.db_path)
-            if db_dir and not os.path.exists(db_dir):
-                os.makedirs(db_dir, exist_ok=True)
-            logger.info(f"Using local SQLite database at {self.db_path}")
+        # Sync queue for background Turso writes
+        self._sync_queue = asyncio.Queue()
+        self._sync_task = None
+        self._loaded_from_turso = False
+        
+        # In-memory caches
+        self._key_cache = {}  # {key_hash: (key_info, expiry)}
+        self._costs_cache = None  # (costs, expiry)
+        self._cache_ttl = 60  # 1 minute for keys
+        self._costs_ttl = 300  # 5 minutes for model costs
+        
+        # Ensure the directory exists for local SQLite (always used)
+        db_dir = os.path.dirname(self.db_path)
+        if db_dir and not os.path.exists(db_dir):
+            os.makedirs(db_dir, exist_ok=True)
+        logger.info(f"Using local SQLite database at {self.db_path}")
+        
+        if self.turso_available:
+            logger.info(f"Turso sync enabled: {config.TURSO_DATABASE_URL}")
+            # Initialize persistent client for Turso
+            self._turso_client = libsql_client.create_client(
+                url=config.TURSO_DATABASE_URL,
+                auth_token=config.TURSO_AUTH_TOKEN
+            )
             
         self.init_db()
         
     @asynccontextmanager
     async def get_db(self):
-        if self.use_turso:
-            # Use libsql package for Turso connection
-            conn = libsql.connect(
-                config.TURSO_DATABASE_URL,
-                auth_token=config.TURSO_AUTH_TOKEN
-            )
+        """Always use local SQLite for speed"""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            yield ConnectionWrapper(conn=db)
+    
+    async def start_sync_task(self):
+        """Start the background sync task"""
+        if self.turso_available and not self._sync_task:
+            self._sync_task = asyncio.create_task(self._process_sync_queue())
+            logger.info("Background Turso sync task started")
+    
+    async def _process_sync_queue(self):
+        """Background task to sync local changes to Turso"""
+        while True:
             try:
-                yield ConnectionWrapper(client=conn)
-            finally:
-                conn.close()
-        else:
+                # Get a batch of items (wait up to 5 seconds to batch)
+                items = []
+                try:
+                    while len(items) < 50:
+                        item = await asyncio.wait_for(self._sync_queue.get(), timeout=5.0)
+                        items.append(item)
+                except asyncio.TimeoutError:
+                    pass
+                
+                if items and self._turso_client:
+                    for sql, params in items:
+                        try:
+                            await self._turso_client.execute(sql, params or ())
+                        except Exception as e:
+                            logger.warning(f"Turso sync error: {e}")
+                    logger.debug(f"Synced {len(items)} items to Turso")
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Sync queue error: {e}")
+                await asyncio.sleep(1)
+    
+    def queue_turso_sync(self, sql: str, params=None):
+        """Queue a SQL statement for background Turso sync"""
+        if self.turso_available:
+            try:
+                self._sync_queue.put_nowait((sql, params))
+            except:
+                pass  # Queue full, skip this sync
+    
+    async def load_from_turso(self):
+        """Load all data from Turso into local SQLite (called once on startup)"""
+        if not self.turso_available or self._loaded_from_turso:
+            return
+        
+        try:
+            logger.info("Loading data from Turso...")
+            
+            # Fetch api_keys from Turso
+            result = await self._turso_client.execute("SELECT * FROM api_keys")
+            if result.rows:
+                async with aiosqlite.connect(self.db_path) as db:
+                    # Clear existing and insert from Turso
+                    await db.execute("DELETE FROM api_keys")
+                    columns = result.columns
+                    placeholders = ",".join(["?"] * len(columns))
+                    col_names = ",".join(columns)
+                    for row in result.rows:
+                        await db.execute(f"INSERT OR REPLACE INTO api_keys ({col_names}) VALUES ({placeholders})", row)
+                    await db.commit()
+                logger.info(f"Loaded {len(result.rows)} API keys from Turso")
+            
+            # Fetch usage_logs (last 1000)
+            result = await self._turso_client.execute("SELECT * FROM usage_logs ORDER BY id DESC LIMIT 1000")
+            if result.rows:
+                async with aiosqlite.connect(self.db_path) as db:
+                    columns = result.columns
+                    placeholders = ",".join(["?"] * len(columns))
+                    col_names = ",".join(columns)
+                    for row in result.rows:
+                        try:
+                            await db.execute(f"INSERT OR REPLACE INTO usage_logs ({col_names}) VALUES ({placeholders})", row)
+                        except:
+                            pass
+                    await db.commit()
+                logger.info(f"Loaded {len(result.rows)} usage logs from Turso")
+            
+            # Fetch model_costs
+            result = await self._turso_client.execute("SELECT * FROM model_costs")
+            if result.rows:
+                async with aiosqlite.connect(self.db_path) as db:
+                    columns = result.columns
+                    placeholders = ",".join(["?"] * len(columns))
+                    col_names = ",".join(columns)
+                    for row in result.rows:
+                        try:
+                            await db.execute(f"INSERT OR REPLACE INTO model_costs ({col_names}) VALUES ({placeholders})", row)
+                        except:
+                            pass
+                    await db.commit()
+                logger.info(f"Loaded {len(result.rows)} model costs from Turso")
+            
+            self._loaded_from_turso = True
+            logger.info("Data loaded from Turso successfully")
+        except Exception as e:
+            logger.error(f"Failed to load from Turso: {e}")
+    
+    async def full_sync_to_turso(self):
+        """Full overwrite sync from local SQLite to Turso (hourly)"""
+        if not self.turso_available or not self._turso_client:
+            return False
+        
+        try:
+            logger.info("Starting full sync to Turso...")
+            
+            # Sync api_keys
             async with aiosqlite.connect(self.db_path) as db:
                 db.row_factory = aiosqlite.Row
-                yield ConnectionWrapper(conn=db)
+                cursor = await db.execute("SELECT * FROM api_keys")
+                rows = await cursor.fetchall()
+                
+                if rows:
+                    # Delete all in Turso and re-insert
+                    await self._turso_client.execute("DELETE FROM api_keys")
+                    for row in rows:
+                        columns = row.keys()
+                        values = list(dict(row).values())
+                        placeholders = ",".join(["?"] * len(columns))
+                        col_names = ",".join(columns)
+                        await self._turso_client.execute(f"INSERT INTO api_keys ({col_names}) VALUES ({placeholders})", values)
+                    logger.info(f"Synced {len(rows)} API keys to Turso")
+                
+                # Sync usage_logs (last 10000)
+                cursor = await db.execute("SELECT * FROM usage_logs ORDER BY id DESC LIMIT 10000")
+                rows = await cursor.fetchall()
+                
+                if rows:
+                    await self._turso_client.execute("DELETE FROM usage_logs")
+                    for row in rows:
+                        columns = row.keys()
+                        values = list(dict(row).values())
+                        placeholders = ",".join(["?"] * len(columns))
+                        col_names = ",".join(columns)
+                        try:
+                            await self._turso_client.execute(f"INSERT INTO usage_logs ({col_names}) VALUES ({placeholders})", values)
+                        except:
+                            pass
+                    logger.info(f"Synced {len(rows)} usage logs to Turso")
+            
+            logger.info("Full sync to Turso completed")
+            return True
+        except Exception as e:
+            logger.error(f"Full sync to Turso failed: {e}")
+            return False
+    
+    async def close(self):
+        """Close the database clients"""
+        if self._sync_task:
+            self._sync_task.cancel()
+        if self._turso_client:
+            await self._turso_client.close()
     
     def init_db(self):
         """Initialize database with required tables"""
-        if self.use_turso:
-            # For Turso, use libsql synchronous connection
-            logger.info("Initializing Turso database tables...")
-            try:
-                conn = libsql.connect(
-                    config.TURSO_DATABASE_URL,
-                    auth_token=config.TURSO_AUTH_TOKEN
-                )
-                self._init_tables(conn)
-                conn.close()
-                logger.info("Turso database tables initialized successfully")
-            except Exception as e:
-                logger.error(f"Failed to initialize Turso database: {e}")
-            return
+        # Run initialization in a way that works for both sync and async
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                # If loop is already running, create a task
+                loop.create_task(self._async_init_db())
+            else:
+                loop.run_until_complete(self._async_init_db())
+        except Exception as e:
+            logger.error(f"Failed to initialize database: {e}")
 
-        # Ensure the directory exists again just in case
-        db_dir = os.path.dirname(self.db_path)
-        if db_dir and not os.path.exists(db_dir):
-            os.makedirs(db_dir, exist_ok=True)
-            
-        conn = sqlite3.connect(self.db_path)
-        self._init_tables(conn)
-        conn.close()
+    async def _async_init_db(self):
+        """Asynchronous database initialization"""
+        async with self.get_db() as db:
+            # We need a cursor-like object to run initialization
+            # Since _init_tables expects a sync connection, we'll adapt or rewrite it
+            await self._init_tables_async(db)
+        logger.info("Database tables initialized successfully")
     
+    async def _init_tables_async(self, db):
+        """Initialize tables using an async connection"""
+        # Create api_keys table
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS api_keys (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                key_hash TEXT UNIQUE NOT NULL,
+                key_prefix TEXT NOT NULL,
+                name TEXT,
+                max_rpm INTEGER DEFAULT 60,
+                max_rpd INTEGER DEFAULT 1000,
+                current_rpm INTEGER DEFAULT 0,
+                current_rpd INTEGER DEFAULT 0,
+                last_reset TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                refresh_hour INTEGER DEFAULT NULL,
+                enabled BOOLEAN DEFAULT 1,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_used_at TIMESTAMP,
+                target_url TEXT DEFAULT NULL,
+                target_api_key TEXT DEFAULT NULL,
+                use_proxy BOOLEAN DEFAULT 1,
+                no_auth BOOLEAN DEFAULT 0,
+                model_mappings TEXT DEFAULT NULL,
+                expires_at TIMESTAMP DEFAULT NULL,
+                ip_whitelist TEXT DEFAULT NULL,
+                ip_blacklist TEXT DEFAULT NULL,
+                providers TEXT DEFAULT NULL,
+                provider_rotation_index INTEGER DEFAULT 0,
+                provider_rotation_frequency INTEGER DEFAULT 1,
+                disable_model_fetch BOOLEAN DEFAULT 0,
+                http_referer TEXT DEFAULT NULL,
+                max_total_tokens INTEGER DEFAULT NULL,
+                total_tokens_used INTEGER DEFAULT 0,
+                max_context_tokens INTEGER DEFAULT NULL,
+                custom_prefills TEXT DEFAULT NULL,
+                budget_limit REAL DEFAULT NULL,
+                budget_used REAL DEFAULT 0,
+                budget_reset_date TEXT DEFAULT NULL
+            )
+        ''')
+        
+        # Helper to execute safely for existing tables
+        async def safe_alter(sql):
+            try:
+                await db.execute(sql)
+            except:
+                pass
+
+        await safe_alter('ALTER TABLE api_keys ADD COLUMN current_rpm INTEGER DEFAULT 0')
+        await safe_alter('ALTER TABLE api_keys ADD COLUMN current_rpd INTEGER DEFAULT 0')
+        await safe_alter('ALTER TABLE api_keys ADD COLUMN last_reset TIMESTAMP DEFAULT CURRENT_TIMESTAMP')
+        await safe_alter('ALTER TABLE api_keys ADD COLUMN refresh_hour INTEGER DEFAULT NULL')
+        await safe_alter('ALTER TABLE api_keys ADD COLUMN target_url TEXT DEFAULT NULL')
+        await safe_alter('ALTER TABLE api_keys ADD COLUMN target_api_key TEXT DEFAULT NULL')
+        await safe_alter('ALTER TABLE api_keys ADD COLUMN use_proxy BOOLEAN DEFAULT 1')
+        await safe_alter('ALTER TABLE api_keys ADD COLUMN no_auth BOOLEAN DEFAULT 0')
+        await safe_alter('ALTER TABLE api_keys ADD COLUMN model_mappings TEXT DEFAULT NULL')
+        await safe_alter('ALTER TABLE api_keys ADD COLUMN expires_at TIMESTAMP DEFAULT NULL')
+        await safe_alter('ALTER TABLE api_keys ADD COLUMN ip_whitelist TEXT DEFAULT NULL')
+        await safe_alter('ALTER TABLE api_keys ADD COLUMN ip_blacklist TEXT DEFAULT NULL')
+        await safe_alter('ALTER TABLE api_keys ADD COLUMN providers TEXT DEFAULT NULL')
+        await safe_alter('ALTER TABLE api_keys ADD COLUMN provider_rotation_index INTEGER DEFAULT 0')
+        await safe_alter('ALTER TABLE api_keys ADD COLUMN provider_rotation_frequency INTEGER DEFAULT 1')
+        await safe_alter('ALTER TABLE api_keys ADD COLUMN disable_model_fetch BOOLEAN DEFAULT 0')
+        await safe_alter('ALTER TABLE api_keys ADD COLUMN http_referer TEXT DEFAULT NULL')
+        await safe_alter('ALTER TABLE api_keys ADD COLUMN max_total_tokens INTEGER DEFAULT NULL')
+        await safe_alter('ALTER TABLE api_keys ADD COLUMN total_tokens_used INTEGER DEFAULT 0')
+        await safe_alter('ALTER TABLE api_keys ADD COLUMN max_context_tokens INTEGER DEFAULT NULL')
+        await safe_alter('ALTER TABLE api_keys ADD COLUMN custom_prefills TEXT DEFAULT NULL')
+        await safe_alter('ALTER TABLE api_keys ADD COLUMN budget_limit REAL DEFAULT NULL')
+        await safe_alter('ALTER TABLE api_keys ADD COLUMN budget_used REAL DEFAULT 0')
+        await safe_alter('ALTER TABLE api_keys ADD COLUMN budget_reset_date TEXT DEFAULT NULL')
+        
+        # Create usage_logs table
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS usage_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                api_key_id INTEGER,
+                model TEXT,
+                tokens_used INTEGER,
+                input_tokens INTEGER,
+                output_tokens INTEGER,
+                cost REAL DEFAULT 0,
+                success BOOLEAN,
+                is_cache_hit BOOLEAN DEFAULT 0,
+                error_message TEXT,
+                client_ip TEXT,
+                request_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (api_key_id) REFERENCES api_keys (id)
+            )
+        ''')
+        
+        await safe_alter('ALTER TABLE usage_logs ADD COLUMN is_cache_hit BOOLEAN DEFAULT 0')
+        await safe_alter('ALTER TABLE usage_logs ADD COLUMN input_tokens INTEGER DEFAULT 0')
+        await safe_alter('ALTER TABLE usage_logs ADD COLUMN output_tokens INTEGER DEFAULT 0')
+        await safe_alter('ALTER TABLE usage_logs ADD COLUMN client_ip TEXT DEFAULT NULL')
+        await safe_alter('ALTER TABLE usage_logs ADD COLUMN cost REAL DEFAULT 0')
+            
+        # Create model_costs table
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS model_costs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                model_pattern TEXT UNIQUE NOT NULL,
+                input_cost_per_1m REAL DEFAULT 0,
+                output_cost_per_1m REAL DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+
+        # Seed some default costs if table is empty
+        cursor = await db.execute('SELECT COUNT(*) as count FROM model_costs')
+        row = await cursor.fetchone()
+        if row and row['count'] == 0:
+            default_costs = [
+                ('gpt-4o', 5.0, 15.0),
+                ('gpt-4-turbo', 10.0, 30.0),
+                ('gpt-3.5-turbo', 0.5, 1.5),
+                ('claude-3-5-sonnet', 3.0, 15.0),
+                ('claude-3-opus', 15.0, 75.0),
+                ('claude-3-haiku', 0.25, 1.25)
+            ]
+            for pattern, input_cost, output_cost in default_costs:
+                await db.execute('INSERT INTO model_costs (model_pattern, input_cost_per_1m, output_cost_per_1m) VALUES (?, ?, ?)', (pattern, input_cost, output_cost))
+        
+        # Create response_cache table
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS response_cache (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                request_hash TEXT UNIQUE NOT NULL,
+                prompt_text TEXT,
+                embedding BLOB,
+                response_body TEXT NOT NULL,
+                model TEXT,
+                input_tokens INTEGER DEFAULT 0,
+                output_tokens INTEGER DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                expires_at TIMESTAMP,
+                hit_count INTEGER DEFAULT 0
+            )
+        ''')
+        
+        # Create indexes
+        await db.execute('CREATE INDEX IF NOT EXISTS idx_response_cache_hash ON response_cache(request_hash)')
+        await db.execute('CREATE INDEX IF NOT EXISTS idx_response_cache_expires ON response_cache(expires_at)')
+        
+        # Create rate_limits table
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS rate_limits (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                api_key_id INTEGER UNIQUE,
+                minute_bucket TEXT,
+                day_bucket TEXT,
+                minute_count INTEGER DEFAULT 0,
+                day_count INTEGER DEFAULT 0,
+                last_reset TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (api_key_id) REFERENCES api_keys(id)
+            )
+        ''')
+        
+        # Create large_context_logs table
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS large_context_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                api_key_id INTEGER,
+                model TEXT,
+                input_tokens INTEGER DEFAULT 0,
+                output_tokens INTEGER DEFAULT 0,
+                total_tokens INTEGER DEFAULT 0,
+                client_ip TEXT,
+                request_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                request_summary TEXT,
+                FOREIGN KEY (api_key_id) REFERENCES api_keys(id)
+            )
+        ''')
+        
+        await db.execute('CREATE INDEX IF NOT EXISTS idx_large_context_time ON large_context_logs(request_time)')
+        
+        await db.commit()
+
+    async def backup_database(self):
+        """Perform an hourly backup of the database"""
+        try:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            backup_dir = Path("backups")
+            backup_dir.mkdir(exist_ok=True)
+            
+            if self.use_turso:
+                # For Turso, we could perform a remote dump if supported, 
+                # but a simple way is to fetch critical tables and save locally as json or sqlite
+                logger.info(f"Starting Turso backup to local file...")
+                backup_path = backup_dir / f"turso_backup_{timestamp}.db"
+                
+                # Create a local sqlite backup of Turso data
+                local_conn = sqlite3.connect(backup_path)
+                # This is a bit complex as we'd need to replicate all tables.
+                # A better approach for Turso is to use their CLI for backups, 
+                # but programmatically we can at least snapshot the api_keys and analytics
+                
+                async with self.get_db() as db:
+                    # Backup api_keys
+                    cursor = await db.execute("SELECT * FROM api_keys")
+                    rows = await cursor.fetchall()
+                    if rows:
+                        columns = rows[0].keys()
+                        placeholders = ",".join(["?"] * len(columns))
+                        local_conn.execute(f"CREATE TABLE api_keys ({','.join(columns)})")
+                        local_conn.executemany(f"INSERT INTO api_keys VALUES ({placeholders})", [tuple(row.values()) for row in rows])
+                    
+                    # Backup usage_logs (limit to last 1000 for quick backup)
+                    cursor = await db.execute("SELECT * FROM usage_logs ORDER BY id DESC LIMIT 1000")
+                    rows = await cursor.fetchall()
+                    if rows:
+                        columns = rows[0].keys()
+                        placeholders = ",".join(["?"] * len(columns))
+                        local_conn.execute(f"CREATE TABLE usage_logs ({','.join(columns)})")
+                        local_conn.executemany(f"INSERT INTO usage_logs VALUES ({placeholders})", [tuple(row.values()) for row in rows])
+                
+                local_conn.commit()
+                local_conn.close()
+                logger.info(f"Turso backup completed: {backup_path}")
+            else:
+                # For local SQLite, just copy the file
+                import shutil
+                backup_path = backup_dir / f"local_backup_{timestamp}.db"
+                shutil.copy2(self.db_path, backup_path)
+                logger.info(f"Local database backup completed: {backup_path}")
+                
+            return True
+        except Exception as e:
+            logger.error(f"Backup failed: {e}")
+            return False
+
     def _init_tables(self, conn):
         """Initialize tables on the given connection (works with both sqlite3 and libsql)"""
         cursor = conn.cursor()
@@ -558,11 +935,20 @@ class Database:
         }
     
     async def validate_api_key(self, api_key: str) -> Optional[Dict[str, Any]]:
-        """Validate API key and return key info if valid"""
+        """Validate API key and return key info if valid (with caching)"""
         key_hash = self.hash_key(api_key)
+        now_ts = datetime.now().timestamp()
+        
+        # Check cache
+        if key_hash in self._key_cache:
+            info, expiry = self._key_cache[key_hash]
+            if now_ts < expiry:
+                return info
         
         async with self.get_db() as db:
-            db.row_factory = aiosqlite.Row
+            if not self.use_turso:
+                db.row_factory = aiosqlite.Row
+                
             cursor = await db.execute('''
                 SELECT id, key_prefix, name, max_rpm, max_rpd, enabled, last_used_at, target_url, target_api_key, use_proxy, no_auth, model_mappings, expires_at, ip_whitelist, ip_blacklist, providers, provider_rotation_index, provider_rotation_frequency, disable_model_fetch, http_referer, max_total_tokens, total_tokens_used, max_context_tokens, custom_prefills, budget_limit, budget_used, budget_reset_date
                 FROM api_keys
@@ -572,6 +958,10 @@ class Database:
             row = await cursor.fetchone()
             
             if row:
+                # Check if key has enabled
+                if not bool(row['enabled']):
+                    return None
+                    
                 # Check if key has expired
                 if row['expires_at']:
                     try:
@@ -579,23 +969,18 @@ class Database:
                         if datetime.now() > expires_at:
                             return None  # Key has expired
                     except:
-                        pass  # If parsing fails, continue without expiration check
+                        pass
                 
-                # Update last_used_at
-                await db.execute('''
-                    UPDATE api_keys
-                    SET last_used_at = CURRENT_TIMESTAMP
-                    WHERE id = ?
-                ''', (row['id'],))
-                await db.commit()
+                # Update last_used_at (don't wait for it to return response faster)
+                asyncio.create_task(self._update_last_used(row['id']))
                 
-                return {
+                key_info = {
                     "id": row['id'],
                     "prefix": row['key_prefix'],
                     "name": row['name'],
                     "max_rpm": row['max_rpm'],
                     "max_rpd": row['max_rpd'],
-                    "enabled": bool(row['enabled']),
+                    "enabled": True,
                     "last_used_at": row['last_used_at'],
                     "target_url": row['target_url'],
                     "target_api_key": row['target_api_key'],
@@ -618,8 +1003,25 @@ class Database:
                     "budget_used": row['budget_used'] or 0,
                     "budget_reset_date": row['budget_reset_date']
                 }
+                
+                # Update cache
+                self._key_cache[key_hash] = (key_info, now_ts + self._cache_ttl)
+                return key_info
             
             return None
+
+    async def _update_last_used(self, key_id: int):
+        """Background task to update last_used_at"""
+        try:
+            async with self.get_db() as db:
+                await db.execute('''
+                    UPDATE api_keys
+                    SET last_used_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                ''', (key_id,))
+                await db.commit()
+        except:
+            pass
     
     async def get_all_keys(self) -> List[Dict[str, Any]]:
         """Get all API keys (without actual keys)"""
@@ -903,12 +1305,24 @@ class Database:
         return 0.0
 
     async def get_model_costs(self) -> List[Dict[str, Any]]:
-        """Get all model cost configurations"""
+        """Get all model cost configurations (with caching)"""
+        now_ts = datetime.now().timestamp()
+        
+        if self._costs_cache:
+            costs, expiry = self._costs_cache
+            if now_ts < expiry:
+                return costs
+                
         async with self.get_db() as db:
-            db.row_factory = aiosqlite.Row
+            if not self.use_turso:
+                db.row_factory = aiosqlite.Row
             cursor = await db.execute('SELECT * FROM model_costs ORDER BY model_pattern ASC')
             rows = await cursor.fetchall()
-            return [dict(row) for row in rows]
+            costs = [dict(row) for row in rows]
+            
+            # Update cache
+            self._costs_cache = (costs, now_ts + self._costs_ttl)
+            return costs
 
     async def update_model_cost(self, pattern: str, input_cost: float, output_cost: float) -> bool:
         """Add or update a model cost pattern"""
