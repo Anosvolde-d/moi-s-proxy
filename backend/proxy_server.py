@@ -875,7 +875,7 @@ async def forward_streaming_request(client_request: Dict[str, Any], api_key_id: 
                         # Zeabur might buffer if chunks are too small too quickly.
                         # Trying dynamic delay or slightly larger chunks might help, 
                         # but user asked for "smoother".
-                        char_delay = 0.0005 
+                        char_delay = 0.01 # Adjusted for ~25 TPS (100 cps)
                         
                         airforce_tail_buffer = ""
                         AIRFORCE_TAIL_SIZE = 60
