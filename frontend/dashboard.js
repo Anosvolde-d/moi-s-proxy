@@ -12,6 +12,10 @@ let allKeys = []; // Store all keys for filtering
 let currentFilter = 'all';
 let currentSearchTerm = '';
 
+// Store full API keys temporarily (keyed by key_prefix for lookup)
+// These are only available during the session when the key was created
+const fullKeyStorage = {};
+
 // Authentication configuration
 const ADMIN_PASSWORD_KEY = 'admin_password';
 const ACCESS_CODE_KEY = 'dashboard_access_verified';
@@ -477,7 +481,7 @@ function connectWebSocket() {
 
     ws.onmessage = (event) => {
         const data = JSON.parse(event.data);
-        
+
         // Handle authentication response
         if (data.type === 'auth_success') {
             console.log('WebSocket authenticated');
@@ -486,14 +490,14 @@ function connectWebSocket() {
             addConsoleLog('INFO', 'Connected to real-time log stream');
             return;
         }
-        
+
         if (data.type === 'auth_failed' || data.error === 'Unauthorized') {
             console.error('WebSocket authentication failed');
             addConsoleLog('ERROR', 'WebSocket authentication failed');
             ws.close();
             return;
         }
-        
+
         if (data.level !== 'PING') {
             addConsoleLog(data.level, data.message, data.timestamp);
         }
@@ -598,6 +602,31 @@ async function copyToClipboard(text, description = 'API Key') {
             showToast('Failed to copy to clipboard', 'error');
         }
         document.body.removeChild(textArea);
+    }
+}
+
+// Copy MOI proxy key - tries to get full key from session storage, falls back to prefix
+async function copyMoiKey(keyPrefix) {
+    // First check in-memory storage
+    let fullKey = fullKeyStorage[keyPrefix];
+
+    // If not in memory, check sessionStorage
+    if (!fullKey) {
+        try {
+            const storedKeys = JSON.parse(sessionStorage.getItem('moi_full_keys') || '{}');
+            fullKey = storedKeys[keyPrefix];
+        } catch (e) {
+            console.warn('Could not read from sessionStorage:', e);
+        }
+    }
+
+    if (fullKey) {
+        // We have the full key from this session
+        await copyToClipboard(fullKey, 'Full MOI Proxy Key');
+    } else {
+        // Full key not available - copy just the prefix with a note
+        await copyToClipboard(keyPrefix, 'MOI Proxy Key Prefix');
+        showToast('Note: Full key only available immediately after creation. Prefix copied.', 'warning', 5000);
     }
 }
 
@@ -777,8 +806,8 @@ function createKeyCard(key) {
         </div>
         
         <div class="key-actions">
-            <button class="btn btn-info" onclick="copyToClipboard('${escapeHtml(key.key_prefix)}...', 'MOI Proxy Key Prefix')" title="Copy the MOI's proxy key prefix (full key only available at creation)">
-                <span>🔑</span> Copy Prefix
+            <button class="btn btn-info" onclick="copyMoiKey('${escapeHtml(key.key_prefix)}')" title="Copy the full MOI proxy key (if available from this session) or the prefix">
+                <span>🔑</span> Copy Key
             </button>
             <button class="btn btn-secondary" onclick="editKey(${key.id}, ${key.max_rpm}, ${key.max_rpd}, window.keyData_${key.id})" title="Edit key settings">
                 <span>✏️</span> Edit
@@ -947,6 +976,18 @@ async function generateKey() {
         const data = await response.json();
 
         closeGenerateModal();
+
+        // Store the full key for later copying (keyed by prefix)
+        fullKeyStorage[data.prefix] = data.api_key;
+
+        // Also store in sessionStorage for persistence during browser session
+        try {
+            const storedKeys = JSON.parse(sessionStorage.getItem('moi_full_keys') || '{}');
+            storedKeys[data.prefix] = data.api_key;
+            sessionStorage.setItem('moi_full_keys', JSON.stringify(storedKeys));
+        } catch (e) {
+            console.warn('Could not store key in sessionStorage:', e);
+        }
 
         // Show the generated key
         document.getElementById('generatedKey').textContent = data.api_key;
@@ -2457,5 +2498,92 @@ async function deleteModelCost(costId) {
         console.error('Error deleting model cost:', error);
         addConsoleLog('ERROR', `Failed to delete model cost: ${error.message}`);
         showToast('Failed to delete model cost', 'error');
+    }
+}
+
+// ==================== DATA MANAGEMENT FUNCTIONS ====================
+
+async function exportData() {
+    try {
+        showToast('Generating backup...', 'info');
+        const response = await apiFetch('/admin/export');
+
+        if (!response.ok) {
+            const data = await response.json();
+            throw new Error(data.detail || 'Export failed');
+        }
+
+        const blob = await response.blob();
+        const url = window.URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+
+        // Extract filename from Content-Disposition header if possible
+        const contentDisposition = response.headers.get('Content-Disposition');
+        let filename = 'db_backup.json';
+        if (contentDisposition) {
+            const match = contentDisposition.match(/filename="?([^"]+)"?/);
+            if (match && match[1]) filename = match[1];
+        }
+
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        window.URL.revokeObjectURL(url);
+
+        showToast('Backup downloaded successfully', 'success');
+    } catch (err) {
+        console.error('Export error:', err);
+        showToast('Failed to download backup: ' + err.message, 'error');
+    }
+}
+
+async function importData(input) {
+    const file = input.files[0];
+    if (!file) return;
+
+    // Confirm first
+    if (!confirm('⚠️ WARNING: This will OVERWRITE all existing data (keys, logs, costs) with the backup content.\n\nAre you sure you want to proceed?')) {
+        input.value = ''; // Reset
+        return;
+    }
+
+    const formData = new FormData();
+    formData.append('file', file);
+
+    try {
+        showToast('Restoring database...', 'info');
+
+        const password = sessionStorage.getItem(ADMIN_PASSWORD_KEY);
+        // We use raw fetch here to handle FormData correctly (browser sets Content-Type)
+        const response = await fetch('/admin/import', {
+            method: 'POST',
+            headers: {
+                'X-Admin-Password': password
+            },
+            body: formData
+        });
+
+        if (response.status === 401) {
+            sessionStorage.removeItem(ADMIN_PASSWORD_KEY);
+            sessionStorage.removeItem(ACCESS_CODE_KEY);
+            window.location.reload();
+            throw new Error('Unauthorized');
+        }
+
+        const data = await response.json();
+
+        if (response.ok) {
+            showToast('Database restored successfully! Reloading...', 'success');
+            setTimeout(() => window.location.reload(), 1500);
+        } else {
+            throw new Error(data.detail || 'Import failed');
+        }
+    } catch (err) {
+        console.error('Import error:', err);
+        showToast('Restore failed: ' + err.message, 'error');
+    } finally {
+        input.value = ''; // Reset input
     }
 }
