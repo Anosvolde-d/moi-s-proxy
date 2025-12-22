@@ -1477,7 +1477,10 @@ class Database:
                      
                 return True
             except Exception as e:
-                logger.error(f"Import failed: {e}")
+                logger.error(f"Import failed during processing: {e}")
+                # Log table name if we are in the loop
+                if 'table' in locals():
+                    logger.error(f"Failure occurred on table: {table}")
                 import traceback
                 traceback.print_exc()
                 await db.rollback()
