@@ -735,268 +735,220 @@ async def forward_streaming_request(client_request: Dict[str, Any], api_key_id: 
                         json=request_body,
                         headers=headers
                     ) as response:
-                            if response.status_code == 429:
-                                await broadcast_log(f"Target 429 Rate Limit. Retrying in {retry_delay}s... ({attempt + 1}/{max_retries})", "WARNING")
-                                await asyncio.sleep(retry_delay)
-                                continue  # Retry loop
+                        if response.status_code == 429:
+                            await broadcast_log(f"Target 429 Rate Limit. Retrying in {retry_delay}s... ({attempt + 1}/{max_retries})", "WARNING")
+                            await asyncio.sleep(retry_delay)
+                            continue  # Retry loop
+                        
+                        logger.info(f"Target connection established. Status: {response.status_code}")
+                        await broadcast_log(f"Connected to Target. Status: {response.status_code}", "INFO")
+    
+                        if response.status_code != 200:
+                            error_text = await response.aread()
+                            error_decoded = error_text.decode()
+                            parsed_error = error_decoded
+                            try:
+                                error_json = json.loads(error_decoded)
+                                if 'error' in error_json:
+                                    error_info = error_json['error']
+                                    if isinstance(error_info, dict):
+                                        error_msg = error_info.get('message', str(error_info))
+                                        error_type = error_info.get('type', 'unknown')
+                                        error_code = error_info.get('code', 'unknown')
+                                        parsed_error = f"[{error_type}] (code: {error_code}): {error_msg}"
+                                    else:
+                                        parsed_error = str(error_info)
+                                elif 'message' in error_json:
+                                    parsed_error = error_json['message']
+                            except json.JSONDecodeError:
+                                pass
                             
-                            logger.info(f"Target connection established. Status: {response.status_code}")
-                            await broadcast_log(f"Connected to Target. Status: {response.status_code}", "INFO")
-        
-                            if response.status_code != 200:
-                                error_text = await response.aread()
-                                error_decoded = error_text.decode()
-                                # Try to parse JSON error for better error message
-                                parsed_error = error_decoded
+                            if response.status_code == 404 and "openrouter.ai" in base_url.lower():
+                                model_name = client_request.get("model", "unknown")
+                                parsed_error = f"Model '{model_name}' not found on OpenRouter."
+                            
+                            await broadcast_log(f"Target API Error (Status {response.status_code}): {parsed_error}", "ERROR")
+                            await db.log_usage(api_key_id, client_request.get("model", "unknown"),
+                                             tokens_used=0, input_tokens=0, output_tokens=0,
+                                             success=False, error_message=parsed_error, client_ip=client_ip)
+                            yield f"data: {json.dumps({'error': 'Target API error', 'details': parsed_error})}\n\n"
+                            return
+                        
+                        # Track tokens
+                        total_tokens = 0
+                        input_tokens = 0
+                        output_tokens = 0
+                        
+                        input_text = json.dumps(client_request.get("messages", []))
+                        estimated_input_tokens = estimate_tokens(input_text)
+                        full_response_text = ""
+                        
+                        # CHARACTER-BY-CHARACTER STREAMING (~900 TPS)
+                        incomplete_line = ""
+                        char_delay = 0.00111
+                        
+                        airforce_tail_buffer = ""
+                        AIRFORCE_TAIL_SIZE = 60
+                        
+                        async for chunk in response.aiter_bytes():
+                            if chunk:
                                 try:
-                                    error_json = json.loads(error_decoded)
-                                    if 'error' in error_json:
-                                        error_info = error_json['error']
-                                        if isinstance(error_info, dict):
-                                            error_msg = error_info.get('message', str(error_info))
-                                            error_type = error_info.get('type', 'unknown')
-                                            error_code = error_info.get('code', 'unknown')
-                                            parsed_error = f"[{error_type}] (code: {error_code}): {error_msg}"
-                                        else:
-                                            parsed_error = str(error_info)
-                                    elif 'message' in error_json:
-                                        parsed_error = error_json['message']
-                                except json.JSONDecodeError:
-                                    pass  # Keep original error text
+                                    text = incomplete_line + chunk.decode('utf-8')
+                                except UnicodeDecodeError:
+                                    text = incomplete_line + chunk.decode('utf-8', errors='replace')
+                                incomplete_line = ""
                                 
-                                # Specific check for OpenRouter 404 (model not found)
-                                if response.status_code == 404 and "openrouter.ai" in base_url.lower():
-                                    model_name = client_request.get("model", "unknown")
-                                    parsed_error = f"Model '{model_name}' not found on OpenRouter. Please verify the model ID."
+                                lines = text.split('\n')
                                 
-                                await broadcast_log(f"Target API Error (Status {response.status_code}): {parsed_error}", "ERROR")
-                                await db.log_usage(api_key_id, client_request.get("model", "unknown"),
-                                                 tokens_used=0, input_tokens=0, output_tokens=0,
-                                                 success=False, error_message=parsed_error, client_ip=client_ip)
-                                yield f"data: {json.dumps({'error': 'Target API error', 'details': parsed_error})}\n\n"
-                                return  # Stop on non-recoverable error
-                            
-                            # Track tokens
-                            total_tokens = 0
-                            input_tokens = 0
-                            output_tokens = 0
-                            
-                            # We need to estimate input tokens since we might not get usage
-                            input_text = json.dumps(client_request.get("messages", []))
-                            estimated_input_tokens = estimate_tokens(input_text)
-                            full_response_text = ""
-                            
-                            # CHARACTER-BY-CHARACTER STREAMING for smooth output (~900 TPS)
-                            # Buffer incomplete SSE lines, but stream content character by character
-                            incomplete_line = ""
-                            char_delay = 0.00111  # 1.11ms delay = ~900 chars/sec
-                            
-                            # For airforce: buffer the last 60 chars to remove the 56-char ad at the end
-                            # This allows immediate streaming while still filtering ads
-                            airforce_tail_buffer = ""
-                            AIRFORCE_TAIL_SIZE = 60  # Buffer last 60 chars (ad is 56 chars)
-                            
-                            async for chunk in response.aiter_bytes():
-                                if chunk:
-                                    # Decode and combine with any incomplete line from previous chunk
-                                    try:
-                                        text = incomplete_line + chunk.decode('utf-8')
-                                    except UnicodeDecodeError:
-                                        text = incomplete_line + chunk.decode('utf-8', errors='replace')
-                                    incomplete_line = ""
-                                    
-                                    # Split into lines, keeping track of incomplete final line
-                                    lines = text.split('\n')
-                                    
-                                    # If text doesn't end with newline, last element is incomplete
-                                    if not text.endswith('\n'):
-                                        incomplete_line = lines.pop()
-                                    
-                                    # Process complete lines
-                                    for line in lines:
-                                        if not line.strip():
-                                            # Empty line - part of SSE format, forward it
-                                            yield "\n"
-                                            continue
+                                if not text.endswith('\n'):
+                                    incomplete_line = lines.pop()
+                                
+                                for line in lines:
+                                    if not line.strip():
+                                        yield "\n"
+                                        continue
+                                        
+                                    if line.startswith('data: ') and line != 'data: [DONE]':
+                                        try:
+                                            json_str = line[6:]
+                                            data = json.loads(json_str)
                                             
-                                        if line.startswith('data: ') and line != 'data: [DONE]':
-                                            try:
-                                                json_str = line[6:]
-                                                data = json.loads(json_str)
+                                            if data is None:
+                                                yield line + "\n"
+                                                continue
+                                            
+                                            if 'error' in data:
+                                                error_info = data['error']
+                                                if isinstance(error_info, dict):
+                                                    error_msg = error_info.get('message', str(error_info))
+                                                    error_type = error_info.get('type', 'unknown')
+                                                    error_code = error_info.get('code', 'unknown')
+                                                    full_error = f"API Error [{error_type}] (code: {error_code}): {error_msg}"
+                                                else:
+                                                    full_error = f"API Error: {error_info}"
+                                                await broadcast_log(full_error, "ERROR")
+                                                await db.log_usage(api_key_id, client_request.get("model", "unknown"),
+                                                                 tokens_used=0, input_tokens=0, output_tokens=0,
+                                                                 success=False, error_message=full_error, client_ip=client_ip)
+                                                yield line + "\n"
+                                                continue
                                                 
-                                                # Guard against data being None
-                                                if data is None:
-                                                    yield line + "\n"
-                                                    continue
-                                                
-                                                # Check for error in the response
-                                                if 'error' in data:
-                                                    error_info = data['error']
-                                                    if isinstance(error_info, dict):
-                                                        error_msg = error_info.get('message', str(error_info))
-                                                        error_type = error_info.get('type', 'unknown')
-                                                        error_code = error_info.get('code', 'unknown')
-                                                        full_error = f"API Error [{error_type}] (code: {error_code}): {error_msg}"
-                                                    else:
-                                                        full_error = f"API Error: {error_info}"
-                                                    await broadcast_log(full_error, "ERROR")
-                                                    await db.log_usage(api_key_id, client_request.get("model", "unknown"),
-                                                                     tokens_used=0, input_tokens=0, output_tokens=0,
-                                                                     success=False, error_message=full_error, client_ip=client_ip)
-                                                    yield line + "\n"
-                                                    continue
+                                            choices = data.get('choices', [])
+                                            
+                                            if choices and isinstance(choices[0], dict):
+                                                if 'error' in choices[0]:
+                                                    error_info = choices[0]['error']
+                                                    error_msg = error_info.get('message', str(error_info)) if isinstance(error_info, dict) else str(error_info)
+                                                    await broadcast_log(f"API Error in choice: {error_msg}", "ERROR")
+                                            
+                                            if choices and 'delta' in choices[0] and 'content' in choices[0]['delta']:
+                                                content = choices[0]['delta']['content']
+                                                if content:
+                                                    full_response_text += content
                                                     
-                                                choices = data.get('choices', [])
-                                                
-                                                # Check for error in choices
-                                                if choices and isinstance(choices[0], dict):
-                                                    if 'error' in choices[0]:
-                                                        error_info = choices[0]['error']
-                                                        error_msg = error_info.get('message', str(error_info)) if isinstance(error_info, dict) else str(error_info)
-                                                        await broadcast_log(f"API Error in choice: {error_msg}", "ERROR")
-                                                
-                                                # Extract content for tracking and character-by-character streaming
-                                                if choices and 'delta' in choices[0] and 'content' in choices[0]['delta']:
-                                                    content = choices[0]['delta']['content']
-                                                    if content:
-                                                        full_response_text += content
+                                                    if is_airforce:
+                                                        airforce_tail_buffer += content
                                                         
-                                                        # For airforce: stream immediately but keep a tail buffer for ad filtering
-                                                        # For others: stream immediately character-by-character
-                                                        if is_airforce:
-                                                            # Add content to tail buffer
-                                                            airforce_tail_buffer += content
+                                                        if len(airforce_tail_buffer) > AIRFORCE_TAIL_SIZE:
+                                                            safe_to_stream = airforce_tail_buffer[:-AIRFORCE_TAIL_SIZE]
+                                                            airforce_tail_buffer = airforce_tail_buffer[-AIRFORCE_TAIL_SIZE:]
                                                             
-                                                            # Stream characters that are safely past the ad detection zone
-                                                            # Keep only the last AIRFORCE_TAIL_SIZE chars in buffer
-                                                            if len(airforce_tail_buffer) > AIRFORCE_TAIL_SIZE:
-                                                                # Stream the safe portion (everything except last AIRFORCE_TAIL_SIZE chars)
-                                                                safe_to_stream = airforce_tail_buffer[:-AIRFORCE_TAIL_SIZE]
-                                                                airforce_tail_buffer = airforce_tail_buffer[-AIRFORCE_TAIL_SIZE:]
-                                                                
-                                                                for char in safe_to_stream:
-                                                                    char_data = {
-                                                                        "id": data.get("id", ""),
-                                                                        "object": data.get("object", "chat.completion.chunk"),
-                                                                        "created": data.get("created", 0),
-                                                                        "model": data.get("model", ""),
-                                                                        "choices": [{
-                                                                            "index": 0,
-                                                                            "delta": {"content": char},
-                                                                            "finish_reason": None
-                                                                        }]
-                                                                    }
-                                                                    yield f"data: {json.dumps(char_data)}\n\n"
-                                                                    await asyncio.sleep(char_delay)
-                                                        else:
-                                                            # Non-airforce: CHARACTER-BY-CHARACTER streaming
-                                                            for char in content:
+                                                            for char in safe_to_stream:
                                                                 char_data = {
                                                                     "id": data.get("id", ""),
                                                                     "object": "chat.completion.chunk",
                                                                     "created": data.get("created", 0),
                                                                     "model": data.get("model", ""),
-                                                                    "choices": [{
-                                                                        "index": 0,
-                                                                        "delta": {"content": char},
-                                                                        "finish_reason": None
-                                                                    }]
+                                                                    "choices": [{"index": 0, "delta": {"content": char}, "finish_reason": None}]
                                                                 }
                                                                 yield f"data: {json.dumps(char_data)}\n\n"
                                                                 await asyncio.sleep(char_delay)
-                                                        
-                                                        # Capture usage if present
-                                                        if 'usage' in data:
-                                                            usage = data['usage']
-                                                            total_tokens = usage.get('total_tokens', 0)
-                                                            input_tokens = usage.get('prompt_tokens', 0)
-                                                            output_tokens = usage.get('completion_tokens', 0)
-                                                        continue
-                                                
-                                                # For non-content chunks (like finish_reason), forward as-is
-                                                yield line + "\n"
+                                                    else:
+                                                        for char in content:
+                                                            char_data = {
+                                                                "id": data.get("id", ""),
+                                                                "object": "chat.completion.chunk",
+                                                                "created": data.get("created", 0),
+                                                                "model": data.get("model", ""),
+                                                                "choices": [{"index": 0, "delta": {"content": char}, "finish_reason": None}]
+                                                            }
+                                                            yield f"data: {json.dumps(char_data)}\n\n"
+                                                            await asyncio.sleep(char_delay)
                                                     
-                                                # Capture usage if present
-                                                if 'usage' in data:
-                                                    usage = data['usage']
-                                                    total_tokens = usage.get('total_tokens', 0)
-                                                    input_tokens = usage.get('prompt_tokens', 0)
-                                                    output_tokens = usage.get('completion_tokens', 0)
-
-                                            except json.JSONDecodeError:
-                                                # If JSON parsing fails, still forward the line
-                                                yield line + "\n"
-                                        elif line == 'data: [DONE]':
-                                            # Forward [DONE] immediately
+                                                    if 'usage' in data:
+                                                        usage = data['usage']
+                                                        total_tokens = usage.get('total_tokens', 0)
+                                                        input_tokens = usage.get('prompt_tokens', 0)
+                                                        output_tokens = usage.get('completion_tokens', 0)
+                                                    continue
+                                            
                                             yield line + "\n"
-                                        elif line.strip():
-                                            # Forward other non-empty lines
-                                            yield line + "\n"
+                                                
+                                            if 'usage' in data:
+                                                usage = data['usage']
+                                                total_tokens = usage.get('total_tokens', 0)
+                                                input_tokens = usage.get('prompt_tokens', 0)
+                                                output_tokens = usage.get('completion_tokens', 0)
 
-                            # Handle any remaining incomplete line
-                            if incomplete_line.strip():
-                                yield incomplete_line + "\n"
+                                        except json.JSONDecodeError:
+                                            yield line + "\n"
+                                    elif line == 'data: [DONE]':
+                                        yield line + "\n"
+                                    elif line.strip():
+                                        yield line + "\n"
+
+                        if incomplete_line.strip():
+                            yield incomplete_line + "\n"
+                        
+                        if is_airforce and airforce_tail_buffer:
+                            AD_LENGTH = 54
+                            if len(airforce_tail_buffer) > AD_LENGTH:
+                                filtered_tail = airforce_tail_buffer[:-AD_LENGTH]
+                                await broadcast_log(f"Removed last {AD_LENGTH} chars (ad) from airforce response", "INFO")
+                            else:
+                                filtered_tail = ""
+                                await broadcast_log(f"Airforce tail buffer ({len(airforce_tail_buffer)} chars) shorter than ad length, skipped", "INFO")
                             
-                            # For airforce: remove the last 54 characters (the ad) from the tail buffer
-                            if is_airforce and airforce_tail_buffer:
-                                # Simply remove the last 54 characters (the ad)
-                                AD_LENGTH = 54
-                                if len(airforce_tail_buffer) > AD_LENGTH:
-                                    filtered_tail = airforce_tail_buffer[:-AD_LENGTH]
-                                    await broadcast_log(f"Removed last {AD_LENGTH} chars (ad) from airforce response", "INFO")
-                                else:
-                                    filtered_tail = ""  # Tail is shorter than ad, skip it entirely
-                                    await broadcast_log(f"Airforce tail buffer ({len(airforce_tail_buffer)} chars) shorter than ad length, skipped", "INFO")
-                                
-                                # Stream the filtered tail character-by-character
-                                for char in filtered_tail:
-                                    char_data = {
-                                        "id": "airforce-filtered",
-                                        "object": "chat.completion.chunk",
-                                        "created": 0,
-                                        "model": client_request.get("model", "unknown"),
-                                        "choices": [{
-                                            "index": 0,
-                                            "delta": {"content": char},
-                                            "finish_reason": None
-                                        }]
-                                    }
-                                    yield f"data: {json.dumps(char_data)}\n\n"
-                                    await asyncio.sleep(char_delay)
-                                
-                                # Update full_response_text for accurate token counting
-                                # (already streamed portion + filtered tail)
-                                chars_already_streamed = len(full_response_text) - len(airforce_tail_buffer)
-                                full_response_text = full_response_text[:chars_already_streamed] + filtered_tail
+                            for char in filtered_tail:
+                                char_data = {
+                                    "id": "airforce-filtered",
+                                    "object": "chat.completion.chunk",
+                                    "created": 0,
+                                    "model": client_request.get("model", "unknown"),
+                                    "choices": [{"index": 0, "delta": {"content": char}, "finish_reason": None}]
+                                }
+                                yield f"data: {json.dumps(char_data)}\n\n"
+                                await asyncio.sleep(char_delay)
                             
-                            await broadcast_log(f"Stream completed", "INFO")
-                            
-                            # Finalize token counts - ALWAYS estimate from actual content
-                            output_tokens = estimate_tokens(full_response_text)
-                            input_tokens = estimated_input_tokens
-                            total_tokens = input_tokens + output_tokens
-                            await broadcast_log(f"Tokens - In: {input_tokens}, Out: {output_tokens}, Total: {total_tokens}", "INFO")
-                            
-                            # Log successful usage with token info
-                            await db.log_usage(api_key_id, client_request.get("model", "unknown"),
-                                             tokens_used=total_tokens, input_tokens=input_tokens,
-                                             output_tokens=output_tokens, success=True, client_ip=client_ip)
-                            
-                            # Log large context request if over 40k tokens threshold
-                            if total_tokens > 40000:
-                                await broadcast_log(f"Large context request logged: {total_tokens} tokens", "INFO")
-                                await db.log_large_context(api_key_id, client_request.get("model", "unknown"),
-                                                          input_tokens=input_tokens, output_tokens=output_tokens,
-                                                          total_tokens=total_tokens, client_ip=client_ip)
-                            return # Exit function on success
-                            
-                    except Exception as e:
-                        await broadcast_log(f"Direct streaming error: {str(e)}", "ERROR")
+                            chars_already_streamed = len(full_response_text) - len(airforce_tail_buffer)
+                            full_response_text = full_response_text[:chars_already_streamed] + filtered_tail
+                        
+                        await broadcast_log(f"Stream completed", "INFO")
+                        
+                        output_tokens = estimate_tokens(full_response_text)
+                        input_tokens = estimated_input_tokens
+                        total_tokens = input_tokens + output_tokens
+                        await broadcast_log(f"Tokens - In: {input_tokens}, Out: {output_tokens}, Total: {total_tokens}", "INFO")
+                        
                         await db.log_usage(api_key_id, client_request.get("model", "unknown"),
-                                         tokens_used=0, input_tokens=0, output_tokens=0,
-                                         success=False, error_message=str(e), client_ip=client_ip)
-                        yield f"data: {json.dumps({'error': str(e)})}\n\n"
+                                         tokens_used=total_tokens, input_tokens=input_tokens,
+                                         output_tokens=output_tokens, success=True, client_ip=client_ip)
+                        
+                        if total_tokens > 40000:
+                            await broadcast_log(f"Large context request logged: {total_tokens} tokens", "INFO")
+                            await db.log_large_context(api_key_id, client_request.get("model", "unknown"),
+                                                      input_tokens=input_tokens, output_tokens=output_tokens,
+                                                      total_tokens=total_tokens, client_ip=client_ip)
                         return
+
+                except Exception as e:
+                    await broadcast_log(f"Direct streaming error: {str(e)}", "ERROR")
+                    await db.log_usage(api_key_id, client_request.get("model", "unknown"),
+                                     tokens_used=0, input_tokens=0, output_tokens=0,
+                                     success=False, error_message=str(e), client_ip=client_ip)
+                    yield f"data: {json.dumps({'error': str(e)})}\n\n"
+                    return
+
 
         except Exception as e:
             # Fallback for outer exceptions
