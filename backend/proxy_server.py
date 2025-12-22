@@ -18,10 +18,26 @@ from urllib.parse import urlencode, quote
 from database import Database
 from config import config
 
-# Configure logging
+# Configure logging with JSON formatter
+class JSONFormatter(logging.Formatter):
+    def format(self, record):
+        log_obj = {
+            "timestamp": self.formatTime(record, self.datefmt),
+            "level": record.levelname,
+            "message": record.getMessage(),
+            "module": record.module,
+            "funcName": record.funcName,
+        }
+        if record.exc_info:
+            log_obj["exception"] = self.formatException(record.exc_info)
+        return json.dumps(log_obj)
+
+handler = logging.StreamHandler()
+handler.setFormatter(JSONFormatter())
 logging.basicConfig(
     level=getattr(logging, config.LOG_LEVEL),
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    handlers=[handler],
+    force=True # Force reconfiguration
 )
 logger = logging.getLogger(__name__)
 
@@ -63,23 +79,28 @@ async def keep_alive_ping():
             logger.debug(f"Keep-alive error (non-critical): {e}")
             await asyncio.sleep(60)  # Wait a minute before retrying
 
-async def hourly_sync_task():
-    """Background task that syncs local data to Turso every hour."""
+async def scheduled_sync_task():
+    """Background task that syncs local data to Turso periodically."""
     while True:
         try:
-            # Wait for 1 hour
-            await asyncio.sleep(3600)
-            logger.info("Running scheduled hourly sync to Turso...")
+            # Wait for configured interval (default 60s)
+            await asyncio.sleep(config.SYNC_INTERVAL)
+            logger.info("Running scheduled sync to Turso...")
+            
+            # Use full sync for robustness
             success = await db.full_sync_to_turso()
+            
             if success:
-                logger.info("Hourly sync to Turso completed successfully")
+                logger.info("Scheduled sync to Turso completed successfully")
             else:
-                logger.warning("Hourly sync to Turso skipped (Turso not available)")
+                # Log as warning only if we expected it to work (Turso configured)
+                if config.TURSO_DATABASE_URL:
+                    logger.warning("Scheduled sync to Turso skipped (connection issue)")
         except asyncio.CancelledError:
             break
         except Exception as e:
             logger.error(f"Error in sync task: {e}")
-            await asyncio.sleep(60)
+            await asyncio.sleep(60) # Backoff on error
 
 @app.on_event("startup")
 async def startup_event():
@@ -108,8 +129,12 @@ async def startup_event():
         logger.info("Keep-alive background task disabled")
         
     # Start hourly full backup to Turso (no real-time sync for speed)
-    _backup_task = asyncio.create_task(hourly_sync_task())
-    logger.info("Hourly Turso backup task started")
+    # Start scheduled full backup to Turso
+    _backup_task = asyncio.create_task(scheduled_sync_task())
+    logger.info(f"Scheduled Turso sync task started (interval: {config.SYNC_INTERVAL}s)")
+    
+    # Start real-time Turso sync task (background queue)
+    await db.start_sync_task()
 
 
 @app.on_event("shutdown")
@@ -150,8 +175,9 @@ async def add_no_buffering_header(request: Request, call_next):
     if "text/event-stream" in response.headers.get("content-type", ""):
         # Disable buffering for Nginx/Cloudflare/Zeabur
         response.headers["X-Accel-Buffering"] = "no"
-        response.headers["Cache-Control"] = "no-cache"
+        response.headers["Cache-Control"] = "no-cache, no-transform"
         response.headers["Connection"] = "keep-alive"
+        response.headers["X-No-Buffering"] = "1" # Extra hint for some proxies
         # Ensure transfer-encoding is chunked (usually handled by FastAPI/Starlette)
     return response
 
@@ -163,9 +189,47 @@ db = Database(config.DATABASE_PATH)
 # Admin authentication
 admin_password_header = APIKeyHeader(name="X-Admin-Password", auto_error=False)
 
-async def verify_admin(x_admin_password: str = Depends(admin_password_header)):
-    """Verify the admin password from the request header"""
+# Rate limit for admin access (simple in-memory)
+class AdminRateLimiter:
+    def __init__(self, limit: int = 100, window: int = 60):
+        self.limit = limit
+        self.window = window
+        self.attempts: Dict[str, List[float]] = {}
+        
+    async def check(self, ip: str) -> bool:
+        now = datetime.now().timestamp()
+        
+        # Clean up old attempts
+        if ip in self.attempts:
+            self.attempts[ip] = [t for t in self.attempts[ip] if now - t < self.window]
+            
+        # Check limit
+        current_attempts = len(self.attempts.get(ip, []))
+        if current_attempts >= self.limit:
+            return False
+            
+        # Add new attempt
+        if ip not in self.attempts:
+            self.attempts[ip] = []
+        self.attempts[ip].append(now)
+        return True
+
+_admin_limiter = AdminRateLimiter()
+
+async def verify_admin(request: Request, x_admin_password: str = Depends(admin_password_header)):
+    """Verify the admin password from the request header with rate limiting"""
+    client_ip = get_client_ip(request)
+    
+    # Check rate limit
+    if not await _admin_limiter.check(client_ip):
+        logger.warning(f"Admin rate limit exceeded for IP: {client_ip}")
+        raise HTTPException(
+            status_code=429,
+            detail="Too many admin login attempts. Please try again later."
+        )
+
     if not x_admin_password or x_admin_password != config.ADMIN_PASSWORD:
+        logger.warning(f"Failed admin login attempt from IP: {client_ip}")
         raise HTTPException(
             status_code=401,
             detail="Unauthorized: Invalid admin password"
@@ -341,24 +405,25 @@ def jailbreak_check(messages: List[Dict[str, Any]]) -> tuple[bool, str]:
     Check for patterns that might be attempting to exploit the PROXY OR SERVER.
     Focus is on "site protection" as requested, excluding AI personality jailbreaks.
     """
-    security_patterns = [
-        r"<script.*?>", # Basic XSS
-        r"javascript:",  # Basic XSS
-        r"onerror=",     # Basic XSS
-        r"onload=",      # Basic XSS
-        r"\.env",        # Attempting to access sensitive files
-        r"/etc/passwd",  # System file access attempt
-        r"C:\\Windows\\", # Windows system path
-        r"\.\./\.\./",   # Path traversal attempt
-        r"DROP TABLE",   # Basic SQL injection hint
-        r"SELECT \* FROM" # Basic SQL injection hint
-    ]
+    # Jailbreak check disabled by user request to allow tool use
+    # security_patterns = [
+    #     r"<script.*?>", # Basic XSS
+    #     r"javascript:",  # Basic XSS
+    #     r"onerror=",     # Basic XSS
+    #     r"onload=",      # Basic XSS
+    #     # r"\.env",      # Removed: Too many false positives for code generation
+    #     r"/etc/passwd",  # System file access attempt
+    #     r"C:\\Windows\\", # Windows system path
+    #     r"\.\./\.\./",   # Path traversal attempt
+    #     r"DROP TABLE",   # Basic SQL injection hint
+    #     r"SELECT \* FROM" # Basic SQL injection hint
+    # ]
     
-    for msg in messages:
-        content = str(msg.get("content", ""))
-        for pattern in security_patterns:
-            if re.search(pattern, content, re.IGNORECASE):
-                return True, f"Security violation: Restricted pattern detected ({pattern})"
+    # for msg in messages:
+    #     content = str(msg.get("content", ""))
+    #     for pattern in security_patterns:
+    #         if re.search(pattern, content, re.IGNORECASE):
+    #             return True, f"Security violation: Restricted pattern detected ({pattern})"
     
     return False, ""
 
@@ -801,9 +866,16 @@ async def forward_streaming_request(client_request: Dict[str, Any], api_key_id: 
                         estimated_input_tokens = estimate_tokens(input_text)
                         full_response_text = ""
                         
-                        # CHARACTER-BY-CHARACTER STREAMING (~900 TPS)
+                        # CHARACTER-BY-CHARACTER STREAMING
+                        # Adjusted for smoother output (Zeabur/Cloudflare)
                         incomplete_line = ""
-                        char_delay = 0.00111
+                        # Use a strictly smaller delay calculation
+                        # 0.001s is usually fine for 1000 chars/sec
+                        # If too fast, chunks clump up. If too slow, it lags.
+                        # Zeabur might buffer if chunks are too small too quickly.
+                        # Trying dynamic delay or slightly larger chunks might help, 
+                        # but user asked for "smoother".
+                        char_delay = 0.0005 
                         
                         airforce_tail_buffer = ""
                         AIRFORCE_TAIL_SIZE = 60
@@ -1171,6 +1243,19 @@ async def generate_embedding(text: str, api_key: str = None, base_url: str = "ht
     return [0.0] * 1536
 
 # Main proxy endpoint
+# Main proxy endpoint
+@app.options("/v1/chat/completions")
+async def chat_completions_options():
+    """Handle preflight requests for chat completions"""
+    return JSONResponse(
+        content="OK",
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "POST, OPTIONS",
+            "Access-Control-Allow-Headers": "*"
+        }
+    )
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     """Main proxy endpoint compatible with OpenAI API"""
@@ -1979,6 +2064,46 @@ async def delete_model_cost(cost_id: int):
             raise HTTPException(status_code=404, detail="Cost setting not found")
         return {"success": True}
     except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Export endpoint
+@app.get("/admin/export", dependencies=[Depends(verify_admin)])
+async def export_data():
+    """
+    Export all data: Keys, Analytics, Costs, Settings.
+    Includes model prices per token and analytics.
+    """
+    try:
+        # Get all keys
+        keys = await db.get_all_keys()
+        
+        # Get analytics (last 30 days)
+        analytics = await db.get_analytics(days=30)
+        
+        # Get model costs
+        costs = await db.get_model_costs()
+        
+        # Get WebScrapingAPI settings
+        ws_settings = {
+            "enabled": config.WEBSCRAPINGAPI_ENABLED,
+            "has_key": bool(config.WEBSCRAPINGAPI_KEY)
+        }
+        
+        export_data = {
+            "timestamp": datetime.now().isoformat(),
+            "keys": keys,
+            "analytics": analytics,
+            "model_costs": costs,
+            "settings": {
+                "webscraping_api": ws_settings,
+                "sync_interval": config.SYNC_INTERVAL,
+                "keep_alive_interval": config.KEEP_ALIVE_INTERVAL
+            }
+        }
+        
+        return export_data
+    except Exception as e:
+        await broadcast_log(f"Error exporting data: {str(e)}", "ERROR")
         raise HTTPException(status_code=500, detail=str(e))
 
 # WebSocket endpoint for real-time logs
