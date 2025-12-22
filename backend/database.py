@@ -137,11 +137,32 @@ class Database:
     async def init_turso_client(self):
         """Initialize Turso client (must be called from async context)"""
         if self.turso_available and not self._turso_client:
-            self._turso_client = libsql_client.create_client(
-                url=config.TURSO_DATABASE_URL,
-                auth_token=config.TURSO_AUTH_TOKEN
-            )
-            logger.info("Turso client initialized")
+            try:
+                self._turso_client = libsql_client.create_client(
+                    url=config.TURSO_DATABASE_URL,
+                    auth_token=config.TURSO_AUTH_TOKEN
+                )
+                logger.info("Turso client initialized")
+                
+                # Initialize tables on Turso as well
+                await self._init_turso_tables()
+            except Exception as e:
+                logger.error(f"Failed to initialize Turso client: {e}")
+                self.turso_available = False # Disable Turso if client fails
+
+    async def _init_turso_tables(self):
+        """Ensure all required tables exist in Turso"""
+        if not self._turso_client:
+            return
+            
+        try:
+            logger.info("Verifying Turso database schema...")
+            # Use ConnectionWrapper to reuse the same table init logic
+            wrapper = ConnectionWrapper(client=self._turso_client)
+            await self._init_tables_async(wrapper)
+            logger.info("Turso database schema verified")
+        except Exception as e:
+            logger.error(f"Error initializing Turso tables: {e}")
 
         
     @asynccontextmanager
@@ -317,16 +338,10 @@ class Database:
         if self._turso_client:
             await self._turso_client.close()
     
-    def init_db(self):
-        """Initialize database with required tables"""
-        # Run initialization in a way that works for both sync and async
+    async def init_db(self):
+        """Initialize database with required tables (asynchronous)"""
         try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                # If loop is already running, create a task
-                loop.create_task(self._async_init_db())
-            else:
-                loop.run_until_complete(self._async_init_db())
+            await self._async_init_db()
         except Exception as e:
             logger.error(f"Failed to initialize database: {e}")
 
