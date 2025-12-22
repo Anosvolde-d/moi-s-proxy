@@ -93,11 +93,15 @@ async def startup_event():
     # Start database initialization
     db.init_db()
     
+    # Initialize Turso client (requires running event loop)
+    await db.init_turso_client()
+    
     # Load data from Turso (once on startup)
     await db.load_from_turso()
     
     # Start background sync task for Turso
     await db.start_sync_task()
+
     
     if config.KEEP_ALIVE_ENABLED:
         _keep_alive_task = asyncio.create_task(keep_alive_ping())
