@@ -1398,6 +1398,77 @@ class Database:
             
             rows = await cursor.fetchall()
             return [dict(row) for row in rows]
+
+    async def export_data(self) -> Dict[str, Any]:
+        """Export all database data to a dictionary"""
+        async with self.get_db() as db:
+            db.row_factory = aiosqlite.Row
+            
+            # Export each table
+            tables = ['api_keys', 'usage_logs', 'model_costs', 'rate_limits', 'large_context_logs']
+            export = {
+                "version": "1.0",
+                "timestamp": datetime.now().isoformat(),
+                "tables": {}
+            }
+            
+            for table in tables:
+                cursor = await db.execute(f"SELECT * FROM {table}")
+                rows = await cursor.fetchall()
+                export["tables"][table] = [dict(row) for row in rows]
+                
+            return export
+
+    async def import_data(self, data: Dict[str, Any]) -> bool:
+        """Import database data from a dictionary (restore)"""
+        if not data or "tables" not in data:
+            return False
+            
+        async with self.get_db() as db:
+            try:
+                # Clear existing tables first to avoid conflicts? 
+                # Let's go with DELETE + INSERT for a full restore.
+                
+                tables = ['api_keys', 'usage_logs', 'model_costs', 'rate_limits', 'large_context_logs']
+                
+                # Disable foreign keys temporarily
+                await db.execute("PRAGMA foreign_keys = OFF")
+                
+                for table in tables:
+                    if table in data["tables"]:
+                        rows = data["tables"][table]
+                        
+                        # Clear table
+                        await db.execute(f"DELETE FROM {table}")
+                        
+                        if not rows:
+                            continue
+
+                        # Insert rows
+                        for row in rows:
+                            columns = row.keys()
+                            placeholders = ",".join(["?"] * len(columns))
+                            col_names = ",".join(columns)
+                            values = list(row.values())
+                            
+                            await db.execute(f"INSERT INTO {table} ({col_names}) VALUES ({placeholders})", values)
+                            
+                await db.execute("PRAGMA foreign_keys = ON")
+                await db.commit()
+                
+                # If Turso is enabled, queue a full sync immediately
+                if self.turso_available:
+                     # Create a task for this to avoid waiting
+                     asyncio.create_task(self.full_sync_to_turso())
+                     
+                return True
+            except Exception as e:
+                logger.error(f"Import failed: {e}")
+                import traceback
+                traceback.print_exc()
+                await db.rollback()
+                return False
+
     
     async def get_large_context_stats(self) -> Dict[str, Any]:
         """Get statistics about large context requests"""
