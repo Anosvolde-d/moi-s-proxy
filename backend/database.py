@@ -130,13 +130,19 @@ class Database:
         
         if self.turso_available:
             logger.info(f"Turso sync enabled: {config.TURSO_DATABASE_URL}")
-            # Initialize persistent client for Turso
+            # Client will be created in async init_turso_client()
+            
+        self.init_db()
+    
+    async def init_turso_client(self):
+        """Initialize Turso client (must be called from async context)"""
+        if self.turso_available and not self._turso_client:
             self._turso_client = libsql_client.create_client(
                 url=config.TURSO_DATABASE_URL,
                 auth_token=config.TURSO_AUTH_TOKEN
             )
-            
-        self.init_db()
+            logger.info("Turso client initialized")
+
         
     @asynccontextmanager
     async def get_db(self):
