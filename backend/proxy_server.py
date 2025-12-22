@@ -112,7 +112,7 @@ async def startup_event():
     _global_client = httpx.AsyncClient(timeout=300.0, limits=limits)
     
     # Start database initialization
-    db.init_db()
+    await db.init_db()
     
     # Initialize Turso client (requires running event loop)
     await db.init_turso_client()
@@ -337,6 +337,11 @@ def convert_to_anthropic_format(openai_request: Dict[str, Any]) -> Dict[str, Any
         anthropic_request["system"] = system_content
     
     anthropic_request["messages"] = filtered_messages
+    
+    # Prefill handling for Anthropic:
+    # Since we now use apply_prefill_injection in the forwarders,
+    # the prefill is already in anthropic_request["messages"] as an assistant message.
+    # We don't need to do anything extra here to avoid duplication.
     
     return anthropic_request
 
@@ -585,6 +590,28 @@ def estimate_tokens(text: str) -> int:
         return 0
     return len(text) // 4
 
+def apply_prefill_injection(body: Dict[str, Any]):
+    """
+    Ensure the 'prefill' field is correctly injected into the 'messages' array
+    for models/providers that don't natively support a top-level prefill.
+    Injects as an assistant message at the end of the history.
+    """
+    prefill = body.get("prefill")
+    if not prefill or not str(prefill).strip():
+        return
+    
+    messages = body.get("messages", [])
+    if not messages:
+        return
+    
+    last_msg = messages[-1]
+    if last_msg.get("role") == "assistant":
+        # Append to existing assistant message
+        last_msg["content"] = f"{last_msg.get('content', '')}\n{prefill}".strip()
+    else:
+        # Add new assistant message for prefill
+        messages.append({"role": "assistant", "content": prefill})
+
 def get_request_body_size(body: Dict[str, Any]) -> int:
     """Calculate the size of a request body in bytes"""
     try:
@@ -805,6 +832,9 @@ async def forward_streaming_request(client_request: Dict[str, Any], api_key_id: 
             # For streaming, we need to send the request with proper headers
             request_body = client_request.copy()
             request_body["stream"] = True
+            
+            # Apply prefill injection (convert to assistant message if needed)
+            apply_prefill_injection(request_body)
             
             # Implement auto-retry loop
             max_retries = 10
@@ -1115,8 +1145,12 @@ async def forward_non_streaming_request(client_request: Dict[str, Any], api_key_
         max_retries = 10
         retry_delay = 1.0
         
+        # Apply prefill injection
+        request_body = client_request.copy()
+        apply_prefill_injection(request_body)
+        
         for attempt in range(max_retries):
-            response = await _global_client.post(final_url, json=client_request, headers=headers)
+            response = await _global_client.post(final_url, json=request_body, headers=headers)
             
             if response.status_code == 429:
                     await broadcast_log(f"Target 429 Rate Limit. Retrying in {retry_delay}s... ({attempt + 1}/{max_retries})", "WARNING")
@@ -1409,19 +1443,31 @@ async def chat_completions(request: Request):
         # Apply custom prefills if configured
         custom_prefills = key_info.get("custom_prefills")
         if custom_prefills:
+            target_prefill = ""
             try:
-                prefill_map = json.loads(custom_prefills) if isinstance(custom_prefills, str) else custom_prefills
-                # Check for model-specific prefill or default
-                target_prefill = prefill_map.get(body["model"], prefill_map.get("default"))
-                if target_prefill:
-                    existing_prefill = body.get("prefill", "")
-                    if existing_prefill:
-                        body["prefill"] = f"{target_prefill}\n{existing_prefill}"
-                    else:
-                        body["prefill"] = target_prefill
-                    await broadcast_log(f"Applied custom prefill for model {body['model']}", "INFO")
-            except:
-                pass
+                # Try to parse as JSON first (lazy check)
+                stripped_prefills = str(custom_prefills).strip()
+                if stripped_prefills.startswith(("{", "[")):
+                    try:
+                        prefill_map = json.loads(stripped_prefills)
+                        if isinstance(prefill_map, dict):
+                            # Get model-specific or default
+                            target_prefill = prefill_map.get(body.get("model", ""), prefill_map.get("default", ""))
+                        else:
+                            target_prefill = stripped_prefills
+                    except:
+                        target_prefill = stripped_prefills
+                else:
+                    target_prefill = stripped_prefills
+            except Exception as e:
+                logger.debug(f"Prefill parsing error: {e}")
+                target_prefill = custom_prefills
+            
+            if target_prefill and str(target_prefill).strip():
+                existing_prefill = body.get("prefill", "")
+                final_prefill = f"{target_prefill}\n{existing_prefill}".strip() if existing_prefill else target_prefill
+                body["prefill"] = final_prefill
+                await broadcast_log(f"Applied custom prefill to 'prefill' field", "INFO")
         
         # Log provider info
         if provider_name:
