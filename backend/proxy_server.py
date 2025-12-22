@@ -139,8 +139,23 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Add GZip compression for faster responses
+# Add GZip Middleware (configured to avoid buffering small streams)
+# Setting minimum_size to 1000 bytes prevents gzip from buffering very small chunks
 app.add_middleware(GZipMiddleware, minimum_size=1000)
+
+@app.middleware("http")
+async def add_no_buffering_header(request: Request, call_next):
+    """Disable buffering for streaming endpoints"""
+    response = await call_next(request)
+    if "text/event-stream" in response.headers.get("content-type", ""):
+        # Disable buffering for Nginx/Cloudflare/Zeabur
+        response.headers["X-Accel-Buffering"] = "no"
+        response.headers["Cache-Control"] = "no-cache"
+        response.headers["Connection"] = "keep-alive"
+        # Ensure transfer-encoding is chunked (usually handled by FastAPI/Starlette)
+    return response
+
+
 
 # Initialize database
 db = Database(config.DATABASE_PATH)
