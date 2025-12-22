@@ -289,6 +289,20 @@ class Database:
                         except:
                             pass
                     logger.info(f"Synced {len(rows)} usage logs to Turso")
+                
+                # Sync model_costs
+                cursor = await db.execute("SELECT * FROM model_costs")
+                rows = await cursor.fetchall()
+                
+                if rows:
+                    await self._turso_client.execute("DELETE FROM model_costs")
+                    for row in rows:
+                        columns = row.keys()
+                        values = list(dict(row).values())
+                        placeholders = ",".join(["?"] * len(columns))
+                        col_names = ",".join(columns)
+                        await self._turso_client.execute(f"INSERT INTO model_costs ({col_names}) VALUES ({placeholders})", values)
+                    logger.info(f"Synced {len(rows)} model costs to Turso")
             
             logger.info("Full sync to Turso completed")
             return True
