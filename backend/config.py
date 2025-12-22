@@ -51,5 +51,9 @@ class Config:
     # Keep-alive settings (to prevent server from sleeping due to inactivity)
     KEEP_ALIVE_ENABLED = os.getenv("KEEP_ALIVE_ENABLED", "true").lower() == "true"
     KEEP_ALIVE_INTERVAL = int(os.getenv("KEEP_ALIVE_INTERVAL", "300"))  # 5 minutes default
+    
+    # Background Sync Interval (seconds)
+    # Default to 60 seconds (1 minute) for frequent backups
+    SYNC_INTERVAL = int(os.getenv("SYNC_INTERVAL", "60"))
 
 config = Config()
