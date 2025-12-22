@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect, Depends, Security
+from fastapi import FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect, Depends, Security, UploadFile, File
 from fastapi.security import APIKeyHeader
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -857,18 +857,26 @@ async def forward_streaming_request(client_request: Dict[str, Any], api_key_id: 
                                                             airforce_tail_buffer = airforce_tail_buffer[-AIRFORCE_TAIL_SIZE:]
                                                             
                                                             # Stream safe content immediately without character splitting or delays
-                                                            if safe_to_stream:
-                                                                chunk_data = {
+                                                            for char in safe_to_stream:
+                                                                char_data = {
                                                                     "id": data.get("id", ""),
                                                                     "object": "chat.completion.chunk",
                                                                     "created": data.get("created", 0),
                                                                     "model": data.get("model", ""),
-                                                                    "choices": [{"index": 0, "delta": {"content": safe_to_stream}, "finish_reason": None}]
+                                                                    "choices": [{"index": 0, "delta": {"content": char}, "finish_reason": None}]
                                                                 }
-                                                                yield f"data: {json.dumps(chunk_data)}\n\n"
+                                                                yield f"data: {json.dumps(char_data)}\n\n"
                                                     else:
-                                                        # Direct streaming for non-Airforce providers
-                                                        yield f"data: {json.dumps(data)}\n\n"
+                                                        # Character-by-character streaming for smooth frontend rendering (no sleep)
+                                                        for char in content:
+                                                            char_data = {
+                                                                "id": data.get("id", ""),
+                                                                "object": "chat.completion.chunk",
+                                                                "created": data.get("created", 0),
+                                                                "model": data.get("model", ""),
+                                                                "choices": [{"index": 0, "delta": {"content": char}, "finish_reason": None}]
+                                                            }
+                                                            yield f"data: {json.dumps(char_data)}\n\n"
 
                                                     
                                                     if 'usage' in data:
@@ -2469,6 +2477,44 @@ async def scheduled_refresh_task():
         except Exception as e:
             logger.error(f"Error in scheduled refresh task: {str(e)}")
             await asyncio.sleep(60)  # Retry after 1 minute on error
+
+# Admin Export/Import Endpoints
+@app.get("/admin/export")
+async def export_database(admin: str = Depends(verify_admin)):
+    """Export the full database to a JSON file"""
+    try:
+        data = await db.export_data()
+        filename = f"db_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        
+        return JSONResponse(
+            content=data,
+            headers={"Content-Disposition": f"attachment; filename={filename}"}
+        )
+    except Exception as e:
+        logger.error(f"Export failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/admin/import")
+async def import_database(file: UploadFile = File(...), admin: str = Depends(verify_admin)):
+    """Import a database backup"""
+    try:
+        content = await file.read()
+        try:
+            data = json.loads(content.decode())
+        except UnicodeDecodeError:
+             # Try fallback encoding
+            data = json.loads(content.decode('utf-8', errors='ignore'))
+            
+        success = await db.import_data(data)
+        if not success:
+            raise HTTPException(status_code=400, detail="Import failed or invalid data")
+            
+        return {"status": "success", "message": "Database restored successfully"}
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid JSON file")
+    except Exception as e:
+        logger.error(f"Import failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 # Startup event
 @app.on_event("startup")
