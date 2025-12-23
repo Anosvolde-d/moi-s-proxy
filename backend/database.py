@@ -663,7 +663,7 @@ class Database:
                 if not self._is_memory_db:
                     await db.close()
 
-    async def get_analytics(self, key_id: int = None) -> Dict[str, Any]:
+    async def get_analytics(self, key_id: int = None, days: int = 7) -> Dict[str, Any]:
         """Get analytics data."""
         if self._use_postgres:
             async with self._pool.acquire() as conn:
@@ -671,26 +671,44 @@ class Database:
                     totals = await conn.fetchrow('''
                         SELECT COUNT(*) as total_requests,
                                SUM(tokens_used) as total_tokens,
+                               SUM(input_tokens) as total_input_tokens,
+                               SUM(output_tokens) as total_output_tokens,
                                SUM(cost) as total_cost,
                                SUM(CASE WHEN success THEN 1 ELSE 0 END) as successful_requests
-                        FROM usage_logs WHERE api_key_id = $1
-                    ''', key_id)
+                        FROM usage_logs 
+                        WHERE api_key_id = $1 
+                        AND request_time >= CURRENT_TIMESTAMP - INTERVAL '%s days'
+                    ''' % days, key_id)
                 else:
                     totals = await conn.fetchrow('''
                         SELECT COUNT(*) as total_requests,
                                SUM(tokens_used) as total_tokens,
+                               SUM(input_tokens) as total_input_tokens,
+                               SUM(output_tokens) as total_output_tokens,
                                SUM(cost) as total_cost,
                                SUM(CASE WHEN success THEN 1 ELSE 0 END) as successful_requests
                         FROM usage_logs
-                    ''')
+                        WHERE request_time >= CURRENT_TIMESTAMP - INTERVAL '%s days'
+                    ''' % days)
+                
+                # Get model usage stats
+                models = await conn.fetch('''
+                    SELECT model, COUNT(*) as count, SUM(tokens_used) as tokens
+                    FROM usage_logs 
+                    WHERE request_time >= CURRENT_TIMESTAMP - INTERVAL '%s days'
+                    GROUP BY model ORDER BY count DESC LIMIT 10
+                ''' % days)
                 
                 return {
                     "totals": {
                         "total_requests": totals['total_requests'] or 0,
                         "total_tokens": totals['total_tokens'] or 0,
+                        "total_input_tokens": totals['total_input_tokens'] or 0,
+                        "total_output_tokens": totals['total_output_tokens'] or 0,
                         "total_cost": totals['total_cost'] or 0,
                         "successful_requests": totals['successful_requests'] or 0
-                    }
+                    },
+                    "models": [dict(row) for row in models]
                 }
         else:
             db = self._shared_conn if self._is_memory_db else await aiosqlite.connect(self.db_path)
@@ -700,27 +718,46 @@ class Database:
                     cursor = await db.execute('''
                         SELECT COUNT(*) as total_requests,
                                SUM(tokens_used) as total_tokens,
+                               SUM(input_tokens) as total_input_tokens,
+                               SUM(output_tokens) as total_output_tokens,
                                SUM(cost) as total_cost,
                                SUM(CASE WHEN success THEN 1 ELSE 0 END) as successful_requests
-                        FROM usage_logs WHERE api_key_id = ?
-                    ''', (key_id,))
+                        FROM usage_logs 
+                        WHERE api_key_id = ?
+                        AND request_time >= datetime('now', ?)
+                    ''', (key_id, f'-{days} days'))
                 else:
                     cursor = await db.execute('''
                         SELECT COUNT(*) as total_requests,
                                SUM(tokens_used) as total_tokens,
+                               SUM(input_tokens) as total_input_tokens,
+                               SUM(output_tokens) as total_output_tokens,
                                SUM(cost) as total_cost,
                                SUM(CASE WHEN success THEN 1 ELSE 0 END) as successful_requests
                         FROM usage_logs
-                    ''')
+                        WHERE request_time >= datetime('now', ?)
+                    ''', (f'-{days} days',))
                 row = await cursor.fetchone()
+                
+                # Get model usage stats
+                cursor = await db.execute('''
+                    SELECT model, COUNT(*) as count, SUM(tokens_used) as tokens
+                    FROM usage_logs 
+                    WHERE request_time >= datetime('now', ?)
+                    GROUP BY model ORDER BY count DESC LIMIT 10
+                ''', (f'-{days} days',))
+                models = await cursor.fetchall()
                 
                 return {
                     "totals": {
                         "total_requests": row['total_requests'] or 0,
                         "total_tokens": row['total_tokens'] or 0,
+                        "total_input_tokens": row['total_input_tokens'] or 0,
+                        "total_output_tokens": row['total_output_tokens'] or 0,
                         "total_cost": row['total_cost'] or 0,
                         "successful_requests": row['successful_requests'] or 0
-                    }
+                    },
+                    "models": [dict(m) for m in models]
                 }
             finally:
                 if not self._is_memory_db:
@@ -887,4 +924,257 @@ class Database:
                 try:
                     yield db
                 finally:
+                    await db.close()
+
+
+    async def ensure_all_rate_limits_exist(self) -> int:
+        """Stub for backward compatibility - rate limits are now in api_keys table."""
+        return 0
+
+    # Alias for validate_key (backward compatibility)
+    async def validate_api_key(self, api_key: str) -> Optional[Dict[str, Any]]:
+        """Alias for validate_key for backward compatibility."""
+        return await self.validate_key(api_key)
+
+    # Alias for update_provider_rotation (backward compatibility)
+    async def update_provider_rotation_index(self, key_id: int, new_index: int):
+        """Alias for update_provider_rotation for backward compatibility."""
+        return await self.update_provider_rotation(key_id, new_index)
+
+    async def log_large_context(self, key_id: int, model: str, input_tokens: int = 0,
+                                output_tokens: int = 0, total_tokens: int = 0,
+                                client_ip: str = None):
+        """Log large context requests. Uses usage_logs with a marker."""
+        # Just log as a regular usage entry - the large context is tracked via tokens
+        await self.log_usage(
+            key_id=key_id,
+            model=model,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            tokens_used=total_tokens,
+            success=True,
+            client_ip=client_ip,
+            error_message=f"Large context: {total_tokens} tokens"
+        )
+
+    async def get_cached_response(self, prompt_hash: str, embedding: Any = None) -> Optional[Dict[str, Any]]:
+        """Stub for cache lookup - caching not implemented in PostgreSQL version."""
+        # Return None to indicate no cache hit
+        return None
+
+    async def cache_response(self, prompt_hash: str, response_body: str, model: str = None,
+                            prompt_text: str = None, embedding: Any = None):
+        """Stub for caching responses - caching not implemented in PostgreSQL version."""
+        # No-op - caching disabled for simplicity
+        pass
+
+    async def update_budget_used(self, key_id: int, tokens_used: int):
+        """Update budget used for a key based on token usage."""
+        # This is already handled in log_usage, but provide explicit method
+        if self._use_postgres:
+            async with self._pool.acquire() as conn:
+                await conn.execute('''
+                    UPDATE api_keys 
+                    SET total_tokens_used = total_tokens_used + $1
+                    WHERE id = $2
+                ''', tokens_used, key_id)
+        else:
+            db = self._shared_conn if self._is_memory_db else await aiosqlite.connect(self.db_path)
+            try:
+                await db.execute('''
+                    UPDATE api_keys 
+                    SET total_tokens_used = total_tokens_used + ?
+                    WHERE id = ?
+                ''', (tokens_used, key_id))
+                await db.commit()
+            finally:
+                if not self._is_memory_db:
+                    await db.close()
+
+    async def get_key_usage(self, key_id: int) -> Optional[Dict[str, Any]]:
+        """Get usage statistics for a specific key."""
+        key = await self.get_api_key_by_id(key_id)
+        if not key:
+            return None
+        
+        if self._use_postgres:
+            async with self._pool.acquire() as conn:
+                stats = await conn.fetchrow('''
+                    SELECT COUNT(*) as total_requests,
+                           SUM(tokens_used) as total_tokens,
+                           SUM(cost) as total_cost,
+                           SUM(CASE WHEN success THEN 1 ELSE 0 END) as successful_requests
+                    FROM usage_logs WHERE api_key_id = $1
+                ''', key_id)
+                return {
+                    "key": key,
+                    "total_requests": stats['total_requests'] or 0,
+                    "total_tokens": stats['total_tokens'] or 0,
+                    "total_cost": stats['total_cost'] or 0,
+                    "successful_requests": stats['successful_requests'] or 0
+                }
+        else:
+            db = self._shared_conn if self._is_memory_db else await aiosqlite.connect(self.db_path)
+            try:
+                db.row_factory = aiosqlite.Row
+                cursor = await db.execute('''
+                    SELECT COUNT(*) as total_requests,
+                           SUM(tokens_used) as total_tokens,
+                           SUM(cost) as total_cost,
+                           SUM(CASE WHEN success THEN 1 ELSE 0 END) as successful_requests
+                    FROM usage_logs WHERE api_key_id = ?
+                ''', (key_id,))
+                stats = await cursor.fetchone()
+                return {
+                    "key": key,
+                    "total_requests": stats['total_requests'] or 0,
+                    "total_tokens": stats['total_tokens'] or 0,
+                    "total_cost": stats['total_cost'] or 0,
+                    "successful_requests": stats['successful_requests'] or 0
+                }
+            finally:
+                if not self._is_memory_db:
+                    await db.close()
+
+    async def get_recent_logs(self, limit: int = 50) -> List[Dict[str, Any]]:
+        """Get recent usage logs across all keys."""
+        return await self.get_key_request_logs(key_id=None, limit=limit)
+
+    async def get_large_context_logs(self, limit: int = 100) -> List[Dict[str, Any]]:
+        """Get logs for large context requests (>40k tokens)."""
+        if self._use_postgres:
+            async with self._pool.acquire() as conn:
+                rows = await conn.fetch('''
+                    SELECT * FROM usage_logs 
+                    WHERE tokens_used > 40000 
+                    ORDER BY request_time DESC LIMIT $1
+                ''', limit)
+                return [dict(row) for row in rows]
+        else:
+            db = self._shared_conn if self._is_memory_db else await aiosqlite.connect(self.db_path)
+            try:
+                db.row_factory = aiosqlite.Row
+                cursor = await db.execute('''
+                    SELECT * FROM usage_logs 
+                    WHERE tokens_used > 40000 
+                    ORDER BY request_time DESC LIMIT ?
+                ''', (limit,))
+                rows = await cursor.fetchall()
+                return [dict(row) for row in rows]
+            finally:
+                if not self._is_memory_db:
+                    await db.close()
+
+    async def get_large_context_stats(self) -> Dict[str, Any]:
+        """Get statistics about large context requests."""
+        if self._use_postgres:
+            async with self._pool.acquire() as conn:
+                stats = await conn.fetchrow('''
+                    SELECT COUNT(*) as count,
+                           AVG(tokens_used) as avg_tokens,
+                           MAX(tokens_used) as max_tokens,
+                           SUM(tokens_used) as total_tokens
+                    FROM usage_logs WHERE tokens_used > 40000
+                ''')
+                return {
+                    "count": stats['count'] or 0,
+                    "avg_tokens": float(stats['avg_tokens'] or 0),
+                    "max_tokens": stats['max_tokens'] or 0,
+                    "total_tokens": stats['total_tokens'] or 0
+                }
+        else:
+            db = self._shared_conn if self._is_memory_db else await aiosqlite.connect(self.db_path)
+            try:
+                db.row_factory = aiosqlite.Row
+                cursor = await db.execute('''
+                    SELECT COUNT(*) as count,
+                           AVG(tokens_used) as avg_tokens,
+                           MAX(tokens_used) as max_tokens,
+                           SUM(tokens_used) as total_tokens
+                    FROM usage_logs WHERE tokens_used > 40000
+                ''')
+                stats = await cursor.fetchone()
+                return {
+                    "count": stats['count'] or 0,
+                    "avg_tokens": float(stats['avg_tokens'] or 0),
+                    "max_tokens": stats['max_tokens'] or 0,
+                    "total_tokens": stats['total_tokens'] or 0
+                }
+            finally:
+                if not self._is_memory_db:
+                    await db.close()
+
+    async def update_model_cost(self, pattern: str, input_cost: float, output_cost: float):
+        """Update or insert model cost - alias for set_model_cost."""
+        return await self.set_model_cost(pattern, input_cost, output_cost)
+
+    async def delete_model_cost(self, cost_id: int) -> bool:
+        """Delete a model cost entry."""
+        if self._use_postgres:
+            async with self._pool.acquire() as conn:
+                result = await conn.execute('DELETE FROM model_costs WHERE id = $1', cost_id)
+                return 'DELETE' in result
+        else:
+            db = self._shared_conn if self._is_memory_db else await aiosqlite.connect(self.db_path)
+            try:
+                await db.execute('DELETE FROM model_costs WHERE id = ?', (cost_id,))
+                await db.commit()
+                return True
+            finally:
+                if not self._is_memory_db:
+                    await db.close()
+
+    async def get_key_stats(self, key_id: int) -> Dict[str, Any]:
+        """Get detailed stats for a specific key."""
+        key = await self.get_api_key_by_id(key_id)
+        if not key:
+            return {}
+        
+        if self._use_postgres:
+            async with self._pool.acquire() as conn:
+                stats = await conn.fetchrow('''
+                    SELECT COUNT(*) as total_requests,
+                           SUM(tokens_used) as total_tokens,
+                           SUM(cost) as total_cost,
+                           SUM(CASE WHEN success THEN 1 ELSE 0 END) as successful_requests,
+                           MAX(request_time) as last_request
+                    FROM usage_logs WHERE api_key_id = $1
+                ''', key_id)
+                return {
+                    "total_requests": stats['total_requests'] or 0,
+                    "total_tokens": stats['total_tokens'] or 0,
+                    "total_cost": float(stats['total_cost'] or 0),
+                    "successful_requests": stats['successful_requests'] or 0,
+                    "last_request": str(stats['last_request']) if stats['last_request'] else None,
+                    "current_rpm": key.get('current_rpm', 0),
+                    "current_rpd": key.get('current_rpd', 0),
+                    "max_rpm": key.get('max_rpm', 60),
+                    "max_rpd": key.get('max_rpd', 1000)
+                }
+        else:
+            db = self._shared_conn if self._is_memory_db else await aiosqlite.connect(self.db_path)
+            try:
+                db.row_factory = aiosqlite.Row
+                cursor = await db.execute('''
+                    SELECT COUNT(*) as total_requests,
+                           SUM(tokens_used) as total_tokens,
+                           SUM(cost) as total_cost,
+                           SUM(CASE WHEN success THEN 1 ELSE 0 END) as successful_requests,
+                           MAX(request_time) as last_request
+                    FROM usage_logs WHERE api_key_id = ?
+                ''', (key_id,))
+                stats = await cursor.fetchone()
+                return {
+                    "total_requests": stats['total_requests'] or 0,
+                    "total_tokens": stats['total_tokens'] or 0,
+                    "total_cost": float(stats['total_cost'] or 0),
+                    "successful_requests": stats['successful_requests'] or 0,
+                    "last_request": str(stats['last_request']) if stats['last_request'] else None,
+                    "current_rpm": key.get('current_rpm', 0),
+                    "current_rpd": key.get('current_rpd', 0),
+                    "max_rpm": key.get('max_rpm', 60),
+                    "max_rpd": key.get('max_rpd', 1000)
+                }
+            finally:
+                if not self._is_memory_db:
                     await db.close()
