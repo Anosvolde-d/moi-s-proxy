@@ -1935,13 +1935,13 @@ async def chat_completions(request: Request):
                 )
                 raise HTTPException(status_code=400, detail=f"Context limit exceeded: {estimated_input} > {key_info['max_context_tokens']} tokens")
 
-        # Security Check: Jailbreak Protection
-        is_jailbreak, jb_error = jailbreak_check(body.get("messages", []))
-        if is_jailbreak:
-            await broadcast_log(f"Jailbreak attempt blocked for key {key_info['prefix']}: {jb_error}", "CAUTION")
-            # Log as failed usage
-            await db.log_usage(key_info["id"], body.get("model", "unknown"), 0, 0, 0, False, jb_error, client_ip)
-            raise HTTPException(status_code=400, detail="Security violation: Prompt contains restricted patterns")
+        # Security Check: Jailbreak Protection (DISABLED)
+        # is_jailbreak, jb_error = jailbreak_check(body.get("messages", []))
+        # if is_jailbreak:
+        #     await broadcast_log(f"Jailbreak attempt blocked for key {key_info['prefix']}: {jb_error}", "CAUTION")
+        #     # Log as failed usage
+        #     await db.log_usage(key_info["id"], body.get("model", "unknown"), 0, 0, 0, False, jb_error, client_ip)
+        #     raise HTTPException(status_code=400, detail="Security violation: Prompt contains restricted patterns")
         
         # Get custom target URL, API key, provider name, no_auth flag, use_proxy, and http_referer from key_info
         # Use provider rotation if providers are configured (get provider FIRST for model mapping)
