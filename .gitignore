@@ -1,3 +1,6 @@
+# Environment variables (IMPORTANT - contains secrets!)
+.env
+
 # Virtual environment
 venv/
 .venv/
@@ -31,3 +34,19 @@ Thumbs.db
 dist/
 build/
 *.egg-info/
+
+# Testing
+.pytest_cache/
+.hypothesis/
+htmlcov/
+.coverage
+
+# Kiro dev tooling
+.kiro/
+
+# Ngrok
+ngrok/
+
+# Backend test cache
+backend/.pytest_cache/
+backend/.hypothesis/
