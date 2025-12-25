@@ -1894,7 +1894,7 @@ async def chat_completions(request: Request):
             raise HTTPException(status_code=401, detail="Invalid API key")
         
         if not key_info["enabled"]:
-            await broadcast_log(f"Disabled API key used: {key_info['prefix']} (IP: {client_ip})", "WARNING")
+            await broadcast_log(f"Disabled API key used: {key_info['key_prefix']} (IP: {client_ip})", "WARNING")
             raise HTTPException(status_code=403, detail="API key is disabled")
         
         # Check IP whitelist/blacklist
@@ -1902,7 +1902,7 @@ async def chat_completions(request: Request):
         ip_blacklist = key_info.get("ip_blacklist", "")
         ip_allowed, ip_error = validate_ip_access(client_ip, ip_whitelist, ip_blacklist)
         if not ip_allowed:
-            await broadcast_log(f"IP access denied for key {key_info['prefix']}: {ip_error}", "WARNING")
+            await broadcast_log(f"IP access denied for key {key_info['key_prefix']}: {ip_error}", "WARNING")
             raise HTTPException(status_code=403, detail=ip_error)
         
         # Check rate limits
@@ -1914,7 +1914,7 @@ async def chat_completions(request: Request):
         
         if not rate_limit_check["allowed"]:
             await broadcast_log(
-                f"Rate limit exceeded for key {key_info['prefix']}: {rate_limit_check['error']}",
+                f"Rate limit exceeded for key {key_info['key_prefix']}: {rate_limit_check['error']}",
                 "WARNING"
             )
             raise HTTPException(status_code=429, detail=rate_limit_check["error"])
@@ -1922,7 +1922,7 @@ async def chat_completions(request: Request):
         # Check Total Token Quota (daily limit)
         if key_info["max_total_tokens"] is not None:
             if key_info["total_tokens_used"] >= key_info["max_total_tokens"]:
-                await broadcast_log(f"Daily token limit exceeded for key {key_info['prefix']}: {key_info['total_tokens_used']} / {key_info['max_total_tokens']} (IP: {client_ip})", "WARNING")
+                await broadcast_log(f"Daily token limit exceeded for key {key_info['key_prefix']}: {key_info['total_tokens_used']} / {key_info['max_total_tokens']} (IP: {client_ip})", "WARNING")
                 raise HTTPException(status_code=403, detail="sorry, daily token limit exceeded")
         
         # Parse request body
@@ -1933,7 +1933,7 @@ async def chat_completions(request: Request):
             # Estimate tokens in the entire request (all fields)
             estimated_input = estimate_request_tokens(body)
             if estimated_input > key_info["max_context_tokens"]:
-                await broadcast_log(f"Context limit exceeded for key {key_info['prefix']}: {estimated_input} > {key_info['max_context_tokens']} tokens (IP: {client_ip})", "WARNING")
+                await broadcast_log(f"Context limit exceeded for key {key_info['key_prefix']}: {estimated_input} > {key_info['max_context_tokens']} tokens (IP: {client_ip})", "WARNING")
                 # Log to high context log with IP, key, and tokens
                 await db.log_large_context(
                     key_info["id"],
@@ -2010,7 +2010,7 @@ async def chat_completions(request: Request):
             cached_row = await db.get_cached_response(prompt_hash, embedding)
             if cached_row:
                 similarity_info = f" (Similarity: {cached_row['similarity']:.2f})" if cached_row.get("is_semantic") else " (Exact)"
-                await broadcast_log(f"Cache Hit!{similarity_info} Serving cached response for key {key_info['prefix']}", "SUCCESS")
+                await broadcast_log(f"Cache Hit!{similarity_info} Serving cached response for key {key_info['key_prefix']}", "SUCCESS")
                 try:
                     cached_response = json.loads(cached_row["response_body"])
                     # Update usage logs for the hit
@@ -2054,9 +2054,9 @@ async def chat_completions(request: Request):
         
         # Log provider info
         if provider_name:
-            target_log_msg = f"Request: {key_info['prefix']} -> {provider_name} ({custom_target_url or 'DEFAULT'})"
+            target_log_msg = f"Request: {key_info['key_prefix']} -> {provider_name} ({custom_target_url or 'DEFAULT'})"
         else:
-            target_log_msg = f"Request: {key_info['prefix']} -> {custom_target_url or 'DEFAULT'}"
+            target_log_msg = f"Request: {key_info['key_prefix']} -> {custom_target_url or 'DEFAULT'}"
         target_key_log = f"Using Custom Key: {'Yes' if custom_target_api_key else 'No'}"
         no_auth_log = f"No Auth: {'Yes' if no_auth else 'No'}"
         proxy_log = f"Proxy: {'On' if use_proxy else 'Off'}"
@@ -3257,11 +3257,20 @@ async def import_database(file: UploadFile = File(...), admin: str = Depends(ver
              # Try fallback encoding
             data = json.loads(content.decode('utf-8', errors='ignore'))
             
-        success = await db.import_data(data)
-        if not success:
-            raise HTTPException(status_code=400, detail="Import failed or invalid data")
-            
-        return {"status": "success", "message": "Database restored successfully"}
+        result = await db.import_data(data)
+        
+        # Check if any data was imported
+        total_imported = result.get("keys", 0) + result.get("costs", 0)
+        errors = result.get("errors", [])
+        
+        if errors:
+            logger.warning(f"Import completed with errors: {errors}")
+        
+        return {
+            "status": "success", 
+            "message": f"Import completed: {result.get('keys', 0)} keys, {result.get('costs', 0)} model costs",
+            "details": result
+        }
     except json.JSONDecodeError:
         raise HTTPException(status_code=400, detail="Invalid JSON file")
     except Exception as e:
