@@ -480,7 +480,14 @@ class Database:
     # ==================== RATE LIMITING ====================
     
     async def check_rate_limit(self, key_id: int, max_rpm: int, max_rpd: int) -> Dict[str, Any]:
-        """Check if request is within rate limits. Returns dict with 'allowed' and 'error' keys."""
+        """Check if request is within rate limits. Returns dict with 'allowed' and 'error' keys.
+        
+        Implements time-based reset:
+        - RPM resets every minute
+        - RPD resets every day
+        """
+        now = datetime.now()
+        
         if self._use_postgres:
             async with self._pool.acquire() as conn:
                 row = await conn.fetchrow(
@@ -492,20 +499,59 @@ class Database:
                 
                 current_rpm = row['current_rpm'] or 0
                 current_rpd = row['current_rpd'] or 0
+                last_reset = row['last_reset']
                 
-                # Check limits (no reset logic needed for simple rate limiting)
+                # Check if we need to reset counters
+                reset_rpm = False
+                reset_rpd = False
+                
+                if last_reset:
+                    # Handle both datetime and string formats
+                    if isinstance(last_reset, str):
+                        try:
+                            last_reset = datetime.fromisoformat(last_reset.replace('Z', '+00:00').replace('+00:00', ''))
+                        except:
+                            last_reset = now  # Fallback to now if parsing fails
+                    
+                    # Reset RPM if more than 1 minute has passed
+                    time_diff = (now - last_reset).total_seconds()
+                    if time_diff >= 60:
+                        reset_rpm = True
+                        current_rpm = 0
+                    
+                    # Reset RPD if it's a new day
+                    if last_reset.date() < now.date():
+                        reset_rpd = True
+                        current_rpd = 0
+                else:
+                    # No last_reset, initialize it
+                    reset_rpm = True
+                    reset_rpd = True
+                    current_rpm = 0
+                    current_rpd = 0
+                
+                # Check limits after potential reset
                 if current_rpm >= max_rpm:
                     return {"allowed": False, "error": f"Rate limit exceeded: {current_rpm}/{max_rpm} RPM"}
                 if current_rpd >= max_rpd:
                     return {"allowed": False, "error": f"Daily limit exceeded: {current_rpd}/{max_rpd} RPD"}
                 
-                # Increment counters
-                await conn.execute('''
-                    UPDATE api_keys 
-                    SET current_rpm = current_rpm + 1, 
-                        current_rpd = current_rpd + 1
-                    WHERE id = $1
-                ''', key_id)
+                # Increment counters and update last_reset if needed
+                if reset_rpm or reset_rpd:
+                    await conn.execute('''
+                        UPDATE api_keys 
+                        SET current_rpm = $1, 
+                            current_rpd = $2,
+                            last_reset = $3
+                        WHERE id = $4
+                    ''', current_rpm + 1, current_rpd + 1, now, key_id)
+                else:
+                    await conn.execute('''
+                        UPDATE api_keys 
+                        SET current_rpm = current_rpm + 1, 
+                            current_rpd = current_rpd + 1
+                        WHERE id = $1
+                    ''', key_id)
                 
                 return {"allowed": True, "error": ""}
         else:
@@ -522,20 +568,59 @@ class Database:
                 
                 current_rpm = row['current_rpm'] or 0
                 current_rpd = row['current_rpd'] or 0
+                last_reset = row['last_reset']
                 
-                # Check limits (no reset logic needed for simple rate limiting)
+                # Check if we need to reset counters
+                reset_rpm = False
+                reset_rpd = False
+                
+                if last_reset:
+                    # Handle both datetime and string formats
+                    if isinstance(last_reset, str):
+                        try:
+                            last_reset = datetime.fromisoformat(last_reset.replace('Z', '+00:00').replace('+00:00', ''))
+                        except:
+                            last_reset = now  # Fallback to now if parsing fails
+                    
+                    # Reset RPM if more than 1 minute has passed
+                    time_diff = (now - last_reset).total_seconds()
+                    if time_diff >= 60:
+                        reset_rpm = True
+                        current_rpm = 0
+                    
+                    # Reset RPD if it's a new day
+                    if last_reset.date() < now.date():
+                        reset_rpd = True
+                        current_rpd = 0
+                else:
+                    # No last_reset, initialize it
+                    reset_rpm = True
+                    reset_rpd = True
+                    current_rpm = 0
+                    current_rpd = 0
+                
+                # Check limits after potential reset
                 if current_rpm >= max_rpm:
                     return {"allowed": False, "error": f"Rate limit exceeded: {current_rpm}/{max_rpm} RPM"}
                 if current_rpd >= max_rpd:
                     return {"allowed": False, "error": f"Daily limit exceeded: {current_rpd}/{max_rpd} RPD"}
                 
-                # Increment counters
-                await db.execute('''
-                    UPDATE api_keys 
-                    SET current_rpm = current_rpm + 1, 
-                        current_rpd = current_rpd + 1
-                    WHERE id = ?
-                ''', (key_id,))
+                # Increment counters and update last_reset if needed
+                if reset_rpm or reset_rpd:
+                    await db.execute('''
+                        UPDATE api_keys 
+                        SET current_rpm = ?, 
+                            current_rpd = ?,
+                            last_reset = ?
+                        WHERE id = ?
+                    ''', (current_rpm + 1, current_rpd + 1, now.isoformat(), key_id))
+                else:
+                    await db.execute('''
+                        UPDATE api_keys 
+                        SET current_rpm = current_rpm + 1, 
+                            current_rpd = current_rpd + 1
+                        WHERE id = ?
+                    ''', (key_id,))
                 await db.commit()
                 
                 return {"allowed": True, "error": ""}
