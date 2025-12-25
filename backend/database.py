@@ -1111,6 +1111,11 @@ class Database:
                 ''', key_id)
                 return {
                     "key": key,
+                    "current_rpm": key.get('current_rpm', 0),
+                    "current_rpd": key.get('current_rpd', 0),
+                    "refresh_hour": key.get('refresh_hour'),
+                    "max_rpm": key.get('max_rpm', 60),
+                    "max_rpd": key.get('max_rpd', 1000),
                     "total_requests": stats['total_requests'] or 0,
                     "total_tokens": stats['total_tokens'] or 0,
                     "total_cost": stats['total_cost'] or 0,
@@ -1130,6 +1135,11 @@ class Database:
                 stats = await cursor.fetchone()
                 return {
                     "key": key,
+                    "current_rpm": key.get('current_rpm', 0),
+                    "current_rpd": key.get('current_rpd', 0),
+                    "refresh_hour": key.get('refresh_hour'),
+                    "max_rpm": key.get('max_rpm', 60),
+                    "max_rpd": key.get('max_rpd', 1000),
                     "total_requests": stats['total_requests'] or 0,
                     "total_tokens": stats['total_tokens'] or 0,
                     "total_cost": stats['total_cost'] or 0,
