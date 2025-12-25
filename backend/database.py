@@ -1215,7 +1215,7 @@ class Database:
 
     async def import_data(self, data: Dict[str, Any]) -> Dict[str, Any]:
         """Import data from a backup JSON file."""
-        imported = {"keys": 0, "logs": 0, "costs": 0, "errors": []}
+        imported = {"keys": 0, "logs": 0, "costs": 0, "skipped": 0, "errors": []}
         
         try:
             # Import API keys
@@ -1224,26 +1224,30 @@ class Database:
                 try:
                     # Skip if key already exists (by key_hash)
                     key_hash = key_data.get("key_hash")
-                    if key_hash:
-                        existing = None
-                        if self._use_postgres:
-                            async with self._pool.acquire() as conn:
-                                existing = await conn.fetchrow(
-                                    'SELECT id FROM api_keys WHERE key_hash = $1', key_hash
-                                )
-                        else:
-                            db = self._shared_conn if self._is_memory_db else await aiosqlite.connect(self.db_path)
-                            try:
-                                cursor = await db.execute(
-                                    'SELECT id FROM api_keys WHERE key_hash = ?', (key_hash,)
-                                )
-                                existing = await cursor.fetchone()
-                            finally:
-                                if not self._is_memory_db:
-                                    await db.close()
+                    if not key_hash:
+                        imported["errors"].append("Key missing key_hash, skipped")
+                        continue
                         
-                        if existing:
-                            continue  # Skip existing keys
+                    existing = None
+                    if self._use_postgres:
+                        async with self._pool.acquire() as conn:
+                            existing = await conn.fetchrow(
+                                'SELECT id FROM api_keys WHERE key_hash = $1', key_hash
+                            )
+                    else:
+                        db = self._shared_conn if self._is_memory_db else await aiosqlite.connect(self.db_path)
+                        try:
+                            cursor = await db.execute(
+                                'SELECT id FROM api_keys WHERE key_hash = ?', (key_hash,)
+                            )
+                            existing = await cursor.fetchone()
+                        finally:
+                            if not self._is_memory_db:
+                                await db.close()
+                    
+                    if existing:
+                        imported["skipped"] += 1
+                        continue  # Skip existing keys
                     
                     # Insert the key
                     if self._use_postgres:
