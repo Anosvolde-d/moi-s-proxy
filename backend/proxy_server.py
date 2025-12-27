@@ -3314,8 +3314,8 @@ async def serve_index():
         dashboard_path = FRONTEND_DIR / "dashboard.html"
         if not dashboard_path.exists():
             raise HTTPException(status_code=404, detail=f"Index not found at {index_path}")
-        return FileResponse(dashboard_path)
-    return FileResponse(index_path)
+        return FileResponse(dashboard_path, media_type="text/html")
+    return FileResponse(index_path, media_type="text/html")
 
 # Admin dashboard endpoint
 @app.get("/admin")
@@ -3325,7 +3325,7 @@ async def serve_dashboard():
     dashboard_path = FRONTEND_DIR / "dashboard.html"
     if not dashboard_path.exists():
         raise HTTPException(status_code=404, detail=f"Dashboard not found at {dashboard_path}")
-    return FileResponse(dashboard_path)
+    return FileResponse(dashboard_path, media_type="text/html")
 
 # Mount static files at /static for backward compatibility
 app.mount("/static", StaticFiles(directory=str(FRONTEND_DIR)), name="static")
