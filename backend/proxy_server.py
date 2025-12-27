@@ -3258,32 +3258,22 @@ async def health_check():
 BACKEND_DIR = Path(__file__).parent
 FRONTEND_DIR = BACKEND_DIR.parent / "frontend"
 
+# Log the paths for debugging
+logger.info(f"Backend directory: {BACKEND_DIR}")
+logger.info(f"Frontend directory: {FRONTEND_DIR}")
+logger.info(f"Frontend exists: {FRONTEND_DIR.exists()}")
+if FRONTEND_DIR.exists():
+    logger.info(f"Frontend contents: {list(FRONTEND_DIR.iterdir())}")
+
 # Serve individual static files at root level
-@app.get("/dashboard.css")
-async def serve_css():
-    """Serve the dashboard CSS file"""
-    from fastapi.responses import FileResponse
-    css_path = FRONTEND_DIR / "dashboard.css"
-    if not css_path.exists():
-        raise HTTPException(status_code=404, detail="CSS file not found")
-    return FileResponse(css_path, media_type="text/css")
-
-@app.get("/dashboard.js")
-async def serve_js():
-    """Serve the dashboard JavaScript file"""
-    from fastapi.responses import FileResponse
-    js_path = FRONTEND_DIR / "dashboard.js"
-    if not js_path.exists():
-        raise HTTPException(status_code=404, detail="JavaScript file not found")
-    return FileResponse(js_path, media_type="application/javascript")
-
 @app.get("/style.css")
 async def serve_public_css():
     """Serve the public landing page CSS file"""
     from fastapi.responses import FileResponse
     css_path = FRONTEND_DIR / "style.css"
+    logger.info(f"Serving style.css from: {css_path}, exists: {css_path.exists()}")
     if not css_path.exists():
-        raise HTTPException(status_code=404, detail="CSS file not found")
+        raise HTTPException(status_code=404, detail=f"CSS file not found at {css_path}")
     return FileResponse(css_path, media_type="text/css")
 
 @app.get("/script.js")
@@ -3292,7 +3282,25 @@ async def serve_public_js():
     from fastapi.responses import FileResponse
     js_path = FRONTEND_DIR / "script.js"
     if not js_path.exists():
-        raise HTTPException(status_code=404, detail="JavaScript file not found")
+        raise HTTPException(status_code=404, detail=f"JavaScript file not found at {js_path}")
+    return FileResponse(js_path, media_type="application/javascript")
+
+@app.get("/dashboard.css")
+async def serve_css():
+    """Serve the dashboard CSS file"""
+    from fastapi.responses import FileResponse
+    css_path = FRONTEND_DIR / "dashboard.css"
+    if not css_path.exists():
+        raise HTTPException(status_code=404, detail=f"CSS file not found at {css_path}")
+    return FileResponse(css_path, media_type="text/css")
+
+@app.get("/dashboard.js")
+async def serve_js():
+    """Serve the dashboard JavaScript file"""
+    from fastapi.responses import FileResponse
+    js_path = FRONTEND_DIR / "dashboard.js"
+    if not js_path.exists():
+        raise HTTPException(status_code=404, detail=f"JavaScript file not found at {js_path}")
     return FileResponse(js_path, media_type="application/javascript")
 
 # Root endpoint to serve public landing page
