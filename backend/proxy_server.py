@@ -3255,8 +3255,17 @@ async def health_check():
     }
 
 # Serve static files (CSS, JS, etc.)
-BACKEND_DIR = Path(__file__).parent
+BACKEND_DIR = Path(__file__).parent.resolve()
 FRONTEND_DIR = BACKEND_DIR.parent / "frontend"
+
+# Fallback: if frontend not found relative to backend, try from current working directory
+if not FRONTEND_DIR.exists():
+    FRONTEND_DIR = Path.cwd().parent / "frontend"
+if not FRONTEND_DIR.exists():
+    FRONTEND_DIR = Path.cwd() / "frontend"
+if not FRONTEND_DIR.exists():
+    # Try absolute path from /app (Docker/Zeabur)
+    FRONTEND_DIR = Path("/app/frontend")
 
 # Log the paths for debugging
 logger.info(f"Backend directory: {BACKEND_DIR}")
@@ -3274,7 +3283,11 @@ async def serve_public_css():
     logger.info(f"Serving style.css from: {css_path}, exists: {css_path.exists()}")
     if not css_path.exists():
         raise HTTPException(status_code=404, detail=f"CSS file not found at {css_path}")
-    return FileResponse(css_path, media_type="text/css")
+    response = FileResponse(css_path, media_type="text/css")
+    response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    return response
 
 @app.get("/script.js")
 async def serve_public_js():
@@ -3283,7 +3296,9 @@ async def serve_public_js():
     js_path = FRONTEND_DIR / "script.js"
     if not js_path.exists():
         raise HTTPException(status_code=404, detail=f"JavaScript file not found at {js_path}")
-    return FileResponse(js_path, media_type="application/javascript")
+    response = FileResponse(js_path, media_type="application/javascript")
+    response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    return response
 
 @app.get("/dashboard.css")
 async def serve_css():
@@ -3292,7 +3307,9 @@ async def serve_css():
     css_path = FRONTEND_DIR / "dashboard.css"
     if not css_path.exists():
         raise HTTPException(status_code=404, detail=f"CSS file not found at {css_path}")
-    return FileResponse(css_path, media_type="text/css")
+    response = FileResponse(css_path, media_type="text/css")
+    response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    return response
 
 @app.get("/dashboard.js")
 async def serve_js():
@@ -3301,7 +3318,9 @@ async def serve_js():
     js_path = FRONTEND_DIR / "dashboard.js"
     if not js_path.exists():
         raise HTTPException(status_code=404, detail=f"JavaScript file not found at {js_path}")
-    return FileResponse(js_path, media_type="application/javascript")
+    response = FileResponse(js_path, media_type="application/javascript")
+    response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    return response
 
 # Root endpoint to serve public landing page
 @app.get("/")
