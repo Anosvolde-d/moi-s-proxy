@@ -3123,9 +3123,9 @@ async def discord_callback(
     # Create session
     session_token = await create_discord_session(user_info)
     
-    # Redirect to claim page with session cookie
-    # **Validates: Requirements 8.3** - OAuth callback redirects to /claim
-    response = RedirectResponse(url="/claim", status_code=302)
+    # Redirect to user dashboard with session cookie
+    # **Validates: Requirements 2.1** - OAuth callback redirects to user dashboard
+    response = RedirectResponse(url="/user-dashboard", status_code=302)
     set_session_cookie(response, session_token)
     
     # Clear the state cookie
@@ -3267,6 +3267,77 @@ async def get_user_keys(request: Request):
     except Exception as e:
         logger.error(f"Error getting user keys: {e}")
         raise HTTPException(status_code=500, detail="Failed to retrieve keys")
+
+
+@app.get("/api/user/dashboard")
+async def get_user_dashboard(request: Request):
+    """
+    Get logged-in user's dashboard data.
+    
+    Returns quota (used, limit, remaining, reset_at), recent logs (last 20),
+    top 5 models by usage count, and total request count.
+    
+    Requires Discord authentication.
+    
+    **Validates: Requirements 2.2, 2.3, 2.4, 2.5**
+    """
+    # Require Discord authentication
+    user = await get_current_user(request)
+    
+    if not user:
+        raise HTTPException(
+            status_code=401,
+            detail="Not authenticated. Please log in with Discord."
+        )
+    
+    discord_id = user.get("discord_id")
+    
+    # Check if user is banned
+    is_banned = await db.is_discord_user_banned(discord_id)
+    if is_banned:
+        raise HTTPException(
+            status_code=403,
+            detail="You got banned bitch, hehe"
+        )
+    
+    try:
+        # Get dashboard data from database
+        dashboard_data = await db.get_user_dashboard_data(discord_id, logs_limit=20)
+        
+        if not dashboard_data:
+            # User has no sub-key yet - return empty dashboard
+            avatar = user.get("avatar")
+            avatar_url = get_discord_avatar_url(discord_id, avatar)
+            
+            return {
+                "user": {
+                    "discord_id": discord_id,
+                    "username": user.get("global_name") or user.get("username"),
+                    "avatar_url": avatar_url,
+                    "sub_key_prefix": None
+                },
+                "quota": {
+                    "used": 0,
+                    "limit": 0,
+                    "remaining": 0,
+                    "reset_at": None
+                },
+                "stats": {
+                    "total_requests": 0,
+                    "top_models": []
+                },
+                "recent_logs": [],
+                "has_sub_key": False
+            }
+        
+        # Add has_sub_key flag to indicate user has claimed a key
+        dashboard_data["has_sub_key"] = True
+        
+        return dashboard_data
+        
+    except Exception as e:
+        logger.error(f"Error getting user dashboard: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve dashboard data")
 
 
 def get_discord_avatar_url(discord_id: str, avatar: Optional[str]) -> str:
@@ -3768,6 +3839,60 @@ async def get_sub_key_usage(sub_key_id: int):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/api/admin/sub-key/{sub_key_id}/reset-quota", dependencies=[Depends(verify_admin)])
+async def reset_sub_key_quota(sub_key_id: int):
+    """
+    Reset a sub-key's daily quota by deleting today's usage logs.
+    
+    This effectively resets their quota to $0.00 for the current day.
+    
+    Args:
+        sub_key_id: The sub-key ID
+        
+    Returns:
+        Success message with the number of logs deleted
+        
+    **Validates: Requirements 1.1, 1.3**
+    """
+    from datetime import timezone
+    
+    try:
+        # Verify the sub-key exists
+        sub_key = await db.get_sub_key_by_id(sub_key_id)
+        if not sub_key:
+            raise HTTPException(status_code=404, detail="Sub-key not found")
+        
+        # Calculate today's midnight UTC
+        now = datetime.now(timezone.utc)
+        today_midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        
+        # Delete today's logs for this sub-key
+        deleted_count = await db.delete_sub_key_logs_since(sub_key_id, today_midnight)
+        
+        # Get the updated usage (should be $0.00 now)
+        dollar_usage = await db.get_sub_key_dollar_usage(sub_key_id)
+        
+        await broadcast_log(
+            f"Reset quota for sub-key {sub_key_id}: deleted {deleted_count} logs, usage now ${dollar_usage.get('current_usage', 0):.2f}",
+            "INFO"
+        )
+        
+        return {
+            "success": True,
+            "sub_key_id": sub_key_id,
+            "logs_deleted": deleted_count,
+            "new_usage": dollar_usage.get('current_usage', 0),
+            "daily_dollar_limit": dollar_usage.get('limit', 20.0),
+            "message": f"Quota reset to $0.00 ({deleted_count} logs deleted)"
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error resetting sub-key quota: {e}")
+        await broadcast_log(f"Error resetting sub-key quota: {str(e)}", "ERROR")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # ==================== GLOBAL SUB-KEY SETTINGS ====================
 
 class GlobalSubKeySettings(BaseModel):
@@ -3876,6 +4001,451 @@ async def update_global_settings(settings: dict):
         raise
     except Exception as e:
         logger.error(f"Error updating global settings: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==================== ANNOUNCEMENTS API ====================
+
+class AnnouncementCreate(BaseModel):
+    """Request model for creating an announcement."""
+    title: str
+    content: str
+    type: str = 'info'  # info, warning, error, poll
+    poll_options: Optional[List[str]] = None
+    expires_at: Optional[str] = None  # ISO format
+    media_url: Optional[str] = None  # URL to image/audio
+    media_type: Optional[str] = None  # image, audio
+
+class AnnouncementUpdate(BaseModel):
+    """Request model for updating an announcement."""
+    title: Optional[str] = None
+    content: Optional[str] = None
+    type: Optional[str] = None
+    poll_options: Optional[List[str]] = None
+    expires_at: Optional[str] = None
+    media_url: Optional[str] = None
+    media_type: Optional[str] = None
+
+class ReactionRequest(BaseModel):
+    """Request model for adding/removing a reaction."""
+    emoji: str
+
+
+@app.get("/api/admin/announcements", dependencies=[Depends(verify_admin)])
+async def get_admin_announcements():
+    """
+    Get all announcements for admin management.
+    
+    **Validates: Requirements 3.1**
+    
+    Returns:
+        List of all announcements with vote counts
+    """
+    try:
+        announcements = await db.get_all_announcements()
+        
+        # Add vote counts for polls
+        for ann in announcements:
+            if ann.get('type') == 'poll' and ann.get('poll_options'):
+                ann['vote_results'] = await db.get_poll_results(ann['id'])
+        
+        return {"announcements": announcements}
+    except Exception as e:
+        logger.error(f"Error getting announcements: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/admin/announcements", dependencies=[Depends(verify_admin)])
+async def create_announcement(announcement: AnnouncementCreate):
+    """
+    Create a new announcement.
+    
+    **Validates: Requirements 3.1, 3.2, 3.4**
+    
+    Args:
+        announcement: Announcement data
+        
+    Returns:
+        Created announcement with ID
+    """
+    try:
+        # Parse expiry date if provided
+        expires_at = None
+        if announcement.expires_at:
+            try:
+                expires_at = datetime.fromisoformat(announcement.expires_at.replace('Z', '+00:00'))
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Invalid expires_at format. Use ISO format.")
+        
+        # Convert poll options to JSON string
+        poll_options_json = None
+        if announcement.poll_options:
+            poll_options_json = json.dumps(announcement.poll_options)
+        
+        announcement_id = await db.create_announcement(
+            title=announcement.title,
+            content=announcement.content,
+            type=announcement.type,
+            poll_options=poll_options_json,
+            expires_at=expires_at,
+            media_url=announcement.media_url,
+            media_type=announcement.media_type
+        )
+        
+        if not announcement_id:
+            raise HTTPException(status_code=500, detail="Failed to create announcement")
+        
+        await broadcast_log(f"Created announcement: {announcement.title}", "INFO")
+        
+        return {
+            "id": announcement_id,
+            "title": announcement.title,
+            "content": announcement.content,
+            "type": announcement.type,
+            "poll_options": announcement.poll_options,
+            "expires_at": announcement.expires_at,
+            "media_url": announcement.media_url,
+            "media_type": announcement.media_type,
+            "message": "Announcement created successfully"
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error creating announcement: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.put("/api/admin/announcements/{announcement_id}", dependencies=[Depends(verify_admin)])
+async def update_announcement(announcement_id: int, update: AnnouncementUpdate):
+    """
+    Update an existing announcement.
+    
+    **Validates: Requirements 3.1**
+    
+    Args:
+        announcement_id: The announcement ID
+        update: Fields to update
+        
+    Returns:
+        Updated announcement
+    """
+    try:
+        # Check if announcement exists
+        existing = await db.get_announcement_by_id(announcement_id)
+        if not existing:
+            raise HTTPException(status_code=404, detail="Announcement not found")
+        
+        # Parse expiry date if provided
+        expires_at = None
+        if update.expires_at:
+            try:
+                expires_at = datetime.fromisoformat(update.expires_at.replace('Z', '+00:00'))
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Invalid expires_at format. Use ISO format.")
+        
+        # Convert poll options to JSON string
+        poll_options_json = None
+        if update.poll_options is not None:
+            poll_options_json = json.dumps(update.poll_options) if update.poll_options else None
+        
+        success = await db.update_announcement(
+            announcement_id=announcement_id,
+            title=update.title,
+            content=update.content,
+            type=update.type,
+            poll_options=poll_options_json,
+            expires_at=expires_at
+        )
+        
+        if not success:
+            raise HTTPException(status_code=500, detail="Failed to update announcement")
+        
+        await broadcast_log(f"Updated announcement {announcement_id}", "INFO")
+        
+        # Get updated announcement
+        updated = await db.get_announcement_by_id(announcement_id)
+        return updated
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error updating announcement: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/api/admin/announcements/{announcement_id}", dependencies=[Depends(verify_admin)])
+async def delete_announcement(announcement_id: int):
+    """
+    Delete an announcement.
+    
+    **Validates: Requirements 3.1**
+    
+    Args:
+        announcement_id: The announcement ID
+        
+    Returns:
+        Success message
+    """
+    try:
+        # Check if announcement exists
+        existing = await db.get_announcement_by_id(announcement_id)
+        if not existing:
+            raise HTTPException(status_code=404, detail="Announcement not found")
+        
+        success = await db.delete_announcement(announcement_id)
+        
+        if not success:
+            raise HTTPException(status_code=500, detail="Failed to delete announcement")
+        
+        await broadcast_log(f"Deleted announcement {announcement_id}: {existing.get('title')}", "INFO")
+        
+        return {"success": True, "message": "Announcement deleted"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error deleting announcement: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/announcements")
+async def get_public_announcements(request: Request):
+    """
+    Get active (non-expired) announcements for public view.
+    
+    **Validates: Requirements 3.3, 3.6**
+    
+    Returns:
+        List of active announcements with poll results and reactions
+    """
+    try:
+        announcements = await db.get_active_announcements()
+        
+        # Get user's Discord ID if logged in (for showing their vote/reactions)
+        discord_id = None
+        session_token = request.cookies.get(SESSION_COOKIE_NAME)
+        if session_token:
+            session = await db.validate_discord_session(session_token)
+            if session:
+                discord_id = session.get('discord_id')
+        
+        # Add vote results, reactions, and user's vote/reactions for each announcement
+        for ann in announcements:
+            # Add poll data
+            if ann.get('type') == 'poll' and ann.get('poll_options'):
+                ann['vote_results'] = await db.get_poll_results(ann['id'])
+                if discord_id:
+                    ann['user_vote'] = await db.get_user_vote(ann['id'], discord_id)
+                # Parse poll_options from JSON
+                try:
+                    ann['poll_options'] = json.loads(ann['poll_options'])
+                except:
+                    pass
+            
+            # Add reactions data for all announcements
+            reactions_data = await db.get_announcement_reactions(ann['id'])
+            # Convert to a simpler format: {emoji: count, ...}
+            ann['reactions'] = {emoji: len(users) for emoji, users in reactions_data.items()}
+            # Add user's reactions if logged in
+            if discord_id:
+                ann['user_reactions'] = await db.get_user_reactions(ann['id'], discord_id)
+            else:
+                ann['user_reactions'] = []
+        
+        return {"announcements": announcements}
+    except Exception as e:
+        logger.error(f"Error getting public announcements: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class PollVote(BaseModel):
+    """Request model for voting on a poll."""
+    option: str
+
+
+@app.post("/api/announcements/{announcement_id}/vote")
+async def vote_on_poll(announcement_id: int, vote: PollVote, request: Request):
+    """
+    Vote on a poll announcement.
+    
+    **Validates: Requirements 5.4**
+    
+    Args:
+        announcement_id: The poll announcement ID
+        vote: The selected option
+        
+    Returns:
+        Updated poll results
+    """
+    try:
+        # Get user's Discord ID from session
+        session_token = request.cookies.get(SESSION_COOKIE_NAME)
+        if not session_token:
+            raise HTTPException(status_code=401, detail="Login required to vote")
+        
+        session = await db.validate_discord_session(session_token)
+        if not session:
+            raise HTTPException(status_code=401, detail="Invalid session. Please login again.")
+        
+        discord_id = session.get('discord_id')
+        if not discord_id:
+            raise HTTPException(status_code=401, detail="Invalid session data")
+        
+        # Get the announcement
+        announcement = await db.get_announcement_by_id(announcement_id)
+        if not announcement:
+            raise HTTPException(status_code=404, detail="Announcement not found")
+        
+        # Verify it's a poll
+        if announcement.get('type') != 'poll':
+            raise HTTPException(status_code=400, detail="This announcement is not a poll")
+        
+        # Check if poll has expired
+        if announcement.get('expires_at'):
+            expires_at = announcement['expires_at']
+            if isinstance(expires_at, str):
+                expires_at = datetime.fromisoformat(expires_at.replace('Z', '+00:00'))
+            if expires_at < datetime.utcnow():
+                raise HTTPException(status_code=400, detail="This poll has expired")
+        
+        # Validate the option
+        poll_options = announcement.get('poll_options')
+        if poll_options:
+            if isinstance(poll_options, str):
+                poll_options = json.loads(poll_options)
+            if vote.option not in poll_options:
+                raise HTTPException(status_code=400, detail="Invalid poll option")
+        
+        # Record the vote
+        await db.vote_on_poll(announcement_id, discord_id, vote.option)
+        
+        # Get updated results
+        results = await db.get_poll_results(announcement_id)
+        
+        return {
+            "success": True,
+            "announcement_id": announcement_id,
+            "your_vote": vote.option,
+            "results": results
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error voting on poll: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/announcements/{announcement_id}/react")
+async def add_reaction(announcement_id: int, reaction: ReactionRequest, request: Request):
+    """
+    Add an emoji reaction to an announcement.
+    
+    Args:
+        announcement_id: The announcement ID
+        reaction: The emoji to react with
+        
+    Returns:
+        Updated reactions for the announcement
+    """
+    try:
+        # Get user's Discord ID from session
+        session_token = request.cookies.get(SESSION_COOKIE_NAME)
+        if not session_token:
+            raise HTTPException(status_code=401, detail="Login required to react")
+        
+        session = await db.validate_discord_session(session_token)
+        if not session:
+            raise HTTPException(status_code=401, detail="Invalid session. Please login again.")
+        
+        discord_id = session.get('discord_id')
+        if not discord_id:
+            raise HTTPException(status_code=401, detail="Invalid session data")
+        
+        # Verify announcement exists
+        announcement = await db.get_announcement_by_id(announcement_id)
+        if not announcement:
+            raise HTTPException(status_code=404, detail="Announcement not found")
+        
+        # Add the reaction
+        await db.add_reaction(announcement_id, discord_id, reaction.emoji)
+        
+        # Get updated reactions
+        reactions = await db.get_announcement_reactions(announcement_id)
+        user_reactions = await db.get_user_reactions(announcement_id, discord_id)
+        
+        return {
+            "success": True,
+            "announcement_id": announcement_id,
+            "reactions": reactions,
+            "user_reactions": user_reactions
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error adding reaction: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/api/announcements/{announcement_id}/react")
+async def remove_reaction(announcement_id: int, reaction: ReactionRequest, request: Request):
+    """
+    Remove an emoji reaction from an announcement.
+    
+    Args:
+        announcement_id: The announcement ID
+        reaction: The emoji to remove
+        
+    Returns:
+        Updated reactions for the announcement
+    """
+    try:
+        # Get user's Discord ID from session
+        session_token = request.cookies.get(SESSION_COOKIE_NAME)
+        if not session_token:
+            raise HTTPException(status_code=401, detail="Login required")
+        
+        session = await db.validate_discord_session(session_token)
+        if not session:
+            raise HTTPException(status_code=401, detail="Invalid session. Please login again.")
+        
+        discord_id = session.get('discord_id')
+        if not discord_id:
+            raise HTTPException(status_code=401, detail="Invalid session data")
+        
+        # Remove the reaction
+        await db.remove_reaction(announcement_id, discord_id, reaction.emoji)
+        
+        # Get updated reactions
+        reactions = await db.get_announcement_reactions(announcement_id)
+        user_reactions = await db.get_user_reactions(announcement_id, discord_id)
+        
+        return {
+            "success": True,
+            "announcement_id": announcement_id,
+            "reactions": reactions,
+            "user_reactions": user_reactions
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error removing reaction: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/admin/announcements/{announcement_id}/reactions", dependencies=[Depends(verify_admin)])
+async def get_announcement_reactions_admin(announcement_id: int):
+    """
+    Get all reactions for an announcement with user details (admin view).
+    
+    Args:
+        announcement_id: The announcement ID
+        
+    Returns:
+        All reactions grouped by emoji with user info
+    """
+    try:
+        reactions = await db.get_announcement_reactions(announcement_id)
+        return {"reactions": reactions}
+    except Exception as e:
+        logger.error(f"Error getting reactions: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -5176,6 +5746,31 @@ async def serve_validator():
     if not validator_path.exists():
         raise HTTPException(status_code=404, detail=f"Validator page not found at {validator_path}")
     return FileResponse(validator_path, media_type="text/html")
+
+
+# User Dashboard page endpoint
+# **Validates: Requirements 2.6, 4.3, 4.4**
+@app.get("/user-dashboard")
+async def serve_user_dashboard():
+    """Serve the user dashboard page for authenticated Discord users"""
+    from fastapi.responses import FileResponse
+    dashboard_path = FRONTEND_DIR / "user-dashboard.html"
+    if not dashboard_path.exists():
+        raise HTTPException(status_code=404, detail=f"User dashboard not found at {dashboard_path}")
+    return FileResponse(dashboard_path, media_type="text/html")
+
+
+# User Dashboard JavaScript
+@app.get("/user-dashboard.js")
+async def serve_user_dashboard_js():
+    """Serve the user dashboard JavaScript file"""
+    from fastapi.responses import FileResponse
+    js_path = FRONTEND_DIR / "user-dashboard.js"
+    if not js_path.exists():
+        raise HTTPException(status_code=404, detail=f"User dashboard JavaScript file not found at {js_path}")
+    response = FileResponse(js_path, media_type="application/javascript")
+    response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    return response
 
 
 # Claim page JavaScript
