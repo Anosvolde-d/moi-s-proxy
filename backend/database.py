@@ -374,6 +374,63 @@ class Database:
             await conn.execute('CREATE INDEX IF NOT EXISTS idx_api_keys_claim_code ON api_keys(claim_code)')
             await conn.execute('CREATE INDEX IF NOT EXISTS idx_usage_logs_sub_key_id ON usage_logs(sub_key_id)')
             
+            # Announcements table for admin announcements system
+            # **Validates: Requirements 3.1, 3.2**
+            await conn.execute('''
+                CREATE TABLE IF NOT EXISTS announcements (
+                    id SERIAL PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    type TEXT DEFAULT 'info',
+                    poll_options TEXT,
+                    media_url TEXT,
+                    media_type TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    expires_at TIMESTAMP,
+                    created_by TEXT
+                )
+            ''')
+            
+            # Migration: Add media columns if they don't exist
+            try:
+                await conn.execute('ALTER TABLE announcements ADD COLUMN IF NOT EXISTS media_url TEXT')
+                await conn.execute('ALTER TABLE announcements ADD COLUMN IF NOT EXISTS media_type TEXT')
+            except:
+                pass
+            
+            # Announcement votes table for poll voting
+            # **Validates: Requirements 5.4**
+            await conn.execute('''
+                CREATE TABLE IF NOT EXISTS announcement_votes (
+                    id SERIAL PRIMARY KEY,
+                    announcement_id INTEGER REFERENCES announcements(id) ON DELETE CASCADE,
+                    discord_id TEXT NOT NULL,
+                    selected_option TEXT NOT NULL,
+                    voted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(announcement_id, discord_id)
+                )
+            ''')
+            
+            # Announcement reactions table for emoji reactions
+            await conn.execute('''
+                CREATE TABLE IF NOT EXISTS announcement_reactions (
+                    id SERIAL PRIMARY KEY,
+                    announcement_id INTEGER REFERENCES announcements(id) ON DELETE CASCADE,
+                    discord_id TEXT NOT NULL,
+                    emoji TEXT NOT NULL,
+                    reacted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(announcement_id, discord_id, emoji)
+                )
+            ''')
+            
+            # Create indexes for announcements
+            await conn.execute('CREATE INDEX IF NOT EXISTS idx_announcements_expires ON announcements(expires_at)')
+            await conn.execute('CREATE INDEX IF NOT EXISTS idx_announcements_created ON announcements(created_at)')
+            await conn.execute('CREATE INDEX IF NOT EXISTS idx_announcement_votes_announcement ON announcement_votes(announcement_id)')
+            await conn.execute('CREATE INDEX IF NOT EXISTS idx_announcement_votes_discord ON announcement_votes(discord_id)')
+            await conn.execute('CREATE INDEX IF NOT EXISTS idx_announcement_reactions_announcement ON announcement_reactions(announcement_id)')
+            await conn.execute('CREATE INDEX IF NOT EXISTS idx_announcement_reactions_discord ON announcement_reactions(discord_id)')
+            
             # Global settings table
             await conn.execute('''
                 CREATE TABLE IF NOT EXISTS global_settings (
@@ -658,6 +715,71 @@ class Database:
             await db.execute('CREATE INDEX IF NOT EXISTS idx_sub_keys_discord_id ON sub_keys(discord_id)')
             await db.execute('CREATE INDEX IF NOT EXISTS idx_api_keys_claim_code ON api_keys(claim_code)')
             await db.execute('CREATE INDEX IF NOT EXISTS idx_usage_logs_sub_key_id ON usage_logs(sub_key_id)')
+        except:
+            pass  # Indexes may already exist
+        
+        # Announcements table for admin announcements system
+        # **Validates: Requirements 3.1, 3.2**
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS announcements (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                content TEXT NOT NULL,
+                type TEXT DEFAULT 'info',
+                poll_options TEXT,
+                media_url TEXT,
+                media_type TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                expires_at TIMESTAMP,
+                created_by TEXT
+            )
+        ''')
+        
+        # Migration: Add media columns if they don't exist
+        try:
+            await db.execute('ALTER TABLE announcements ADD COLUMN media_url TEXT')
+        except:
+            pass  # Column already exists
+        try:
+            await db.execute('ALTER TABLE announcements ADD COLUMN media_type TEXT')
+        except:
+            pass  # Column already exists
+        
+        # Announcement votes table for poll voting
+        # **Validates: Requirements 5.4**
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS announcement_votes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                announcement_id INTEGER NOT NULL,
+                discord_id TEXT NOT NULL,
+                selected_option TEXT NOT NULL,
+                voted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (announcement_id) REFERENCES announcements(id) ON DELETE CASCADE,
+                UNIQUE(announcement_id, discord_id)
+            )
+        ''')
+        
+        # Announcement reactions table for emoji reactions
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS announcement_reactions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                announcement_id INTEGER NOT NULL,
+                discord_id TEXT NOT NULL,
+                emoji TEXT NOT NULL,
+                reacted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (announcement_id) REFERENCES announcements(id) ON DELETE CASCADE,
+                UNIQUE(announcement_id, discord_id, emoji)
+            )
+        ''')
+        
+        # Create indexes for announcements
+        try:
+            await db.execute('CREATE INDEX IF NOT EXISTS idx_announcements_expires ON announcements(expires_at)')
+            await db.execute('CREATE INDEX IF NOT EXISTS idx_announcements_created ON announcements(created_at)')
+            await db.execute('CREATE INDEX IF NOT EXISTS idx_announcement_votes_announcement ON announcement_votes(announcement_id)')
+            await db.execute('CREATE INDEX IF NOT EXISTS idx_announcement_votes_discord ON announcement_votes(discord_id)')
+            await db.execute('CREATE INDEX IF NOT EXISTS idx_announcement_reactions_announcement ON announcement_reactions(announcement_id)')
+            await db.execute('CREATE INDEX IF NOT EXISTS idx_announcement_reactions_discord ON announcement_reactions(discord_id)')
         except:
             pass  # Indexes may already exist
         
@@ -4652,6 +4774,773 @@ class Database:
                 ''', (claim_code, key_id))
                 await db.commit()
                 return cursor.rowcount > 0
+            finally:
+                if not self._is_memory_db:
+                    await db.close()
+
+
+    async def delete_sub_key_logs_since(self, sub_key_id: int, since: datetime) -> int:
+        """
+        Delete usage logs for a sub-key since a given timestamp.
+        
+        This is used to reset a user's daily quota by deleting today's logs.
+        
+        **Validates: Requirements 1.1, 1.3**
+        
+        Args:
+            sub_key_id: The sub-key ID
+            since: Delete logs from this timestamp onwards
+            
+        Returns:
+            int: Number of logs deleted
+        """
+        if self._use_postgres:
+            async with self._pool.acquire() as conn:
+                # Use naive datetime for PostgreSQL comparison
+                since_naive = since.replace(tzinfo=None)
+                result = await conn.execute('''
+                    DELETE FROM usage_logs 
+                    WHERE sub_key_id = $1 AND request_time >= $2
+                ''', sub_key_id, since_naive)
+                # Parse the result to get the count (format: "DELETE N")
+                count = int(result.split()[-1]) if result else 0
+                logger.info(f"Deleted {count} logs for sub-key {sub_key_id} since {since}")
+                return count
+        else:
+            db = self._shared_conn if self._is_memory_db else await aiosqlite.connect(self.db_path)
+            try:
+                since_str = since.strftime('%Y-%m-%d %H:%M:%S')
+                cursor = await db.execute('''
+                    DELETE FROM usage_logs 
+                    WHERE sub_key_id = ? AND request_time >= ?
+                ''', (sub_key_id, since_str))
+                await db.commit()
+                count = cursor.rowcount
+                logger.info(f"Deleted {count} logs for sub-key {sub_key_id} since {since}")
+                return count
+            finally:
+                if not self._is_memory_db:
+                    await db.close()
+
+
+    # ==================== ANNOUNCEMENTS CRUD ====================
+    
+    async def create_announcement(self, title: str, content: str, type: str = 'info', 
+                                   poll_options: Optional[str] = None, 
+                                   expires_at: Optional[datetime] = None,
+                                   created_by: Optional[str] = None,
+                                   media_url: Optional[str] = None,
+                                   media_type: Optional[str] = None) -> Optional[int]:
+        """
+        Create a new announcement.
+        
+        **Validates: Requirements 3.1, 3.2**
+        
+        Args:
+            title: Announcement title
+            content: Announcement content
+            type: Type of announcement (info, warning, error, poll)
+            poll_options: JSON string of poll options (for polls)
+            expires_at: Optional expiration datetime
+            created_by: Discord ID of admin who created it
+            media_url: Optional URL to image/audio media
+            media_type: Optional media type (image, audio)
+            
+        Returns:
+            int: ID of the created announcement, or None on failure
+        """
+        if self._use_postgres:
+            async with self._pool.acquire() as conn:
+                expires_naive = expires_at.replace(tzinfo=None) if expires_at else None
+                row = await conn.fetchrow('''
+                    INSERT INTO announcements (title, content, type, poll_options, expires_at, created_by, media_url, media_type)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                    RETURNING id
+                ''', title, content, type, poll_options, expires_naive, created_by, media_url, media_type)
+                return row['id'] if row else None
+        else:
+            db = self._shared_conn if self._is_memory_db else await aiosqlite.connect(self.db_path)
+            try:
+                expires_str = expires_at.strftime('%Y-%m-%d %H:%M:%S') if expires_at else None
+                cursor = await db.execute('''
+                    INSERT INTO announcements (title, content, type, poll_options, expires_at, created_by, media_url, media_type)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (title, content, type, poll_options, expires_str, created_by, media_url, media_type))
+                await db.commit()
+                return cursor.lastrowid
+            finally:
+                if not self._is_memory_db:
+                    await db.close()
+
+    async def get_all_announcements(self) -> List[Dict[str, Any]]:
+        """
+        Get all announcements (for admin view).
+        
+        **Validates: Requirements 3.1**
+        
+        Returns:
+            List of all announcements ordered by created_at desc
+        """
+        if self._use_postgres:
+            async with self._pool.acquire() as conn:
+                rows = await conn.fetch('''
+                    SELECT * FROM announcements ORDER BY created_at DESC
+                ''')
+                return [dict(row) for row in rows]
+        else:
+            db = self._shared_conn if self._is_memory_db else await aiosqlite.connect(self.db_path)
+            try:
+                db.row_factory = aiosqlite.Row
+                cursor = await db.execute('''
+                    SELECT * FROM announcements ORDER BY created_at DESC
+                ''')
+                rows = await cursor.fetchall()
+                return [dict(row) for row in rows]
+            finally:
+                if not self._is_memory_db:
+                    await db.close()
+
+    async def get_active_announcements(self) -> List[Dict[str, Any]]:
+        """
+        Get active (non-expired) announcements for public view.
+        
+        **Validates: Requirements 3.3, 3.6**
+        
+        Returns:
+            List of active announcements ordered by created_at desc
+        """
+        if self._use_postgres:
+            async with self._pool.acquire() as conn:
+                now = datetime.utcnow()
+                rows = await conn.fetch('''
+                    SELECT * FROM announcements 
+                    WHERE expires_at IS NULL OR expires_at > $1
+                    ORDER BY created_at DESC
+                ''', now)
+                return [dict(row) for row in rows]
+        else:
+            db = self._shared_conn if self._is_memory_db else await aiosqlite.connect(self.db_path)
+            try:
+                db.row_factory = aiosqlite.Row
+                now_str = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+                cursor = await db.execute('''
+                    SELECT * FROM announcements 
+                    WHERE expires_at IS NULL OR expires_at > ?
+                    ORDER BY created_at DESC
+                ''', (now_str,))
+                rows = await cursor.fetchall()
+                return [dict(row) for row in rows]
+            finally:
+                if not self._is_memory_db:
+                    await db.close()
+
+    async def get_announcement_by_id(self, announcement_id: int) -> Optional[Dict[str, Any]]:
+        """
+        Get a single announcement by ID.
+        
+        Args:
+            announcement_id: The announcement ID
+            
+        Returns:
+            Announcement dict or None if not found
+        """
+        if self._use_postgres:
+            async with self._pool.acquire() as conn:
+                row = await conn.fetchrow('''
+                    SELECT * FROM announcements WHERE id = $1
+                ''', announcement_id)
+                return dict(row) if row else None
+        else:
+            db = self._shared_conn if self._is_memory_db else await aiosqlite.connect(self.db_path)
+            try:
+                db.row_factory = aiosqlite.Row
+                cursor = await db.execute('''
+                    SELECT * FROM announcements WHERE id = ?
+                ''', (announcement_id,))
+                row = await cursor.fetchone()
+                return dict(row) if row else None
+            finally:
+                if not self._is_memory_db:
+                    await db.close()
+
+    async def update_announcement(self, announcement_id: int, title: Optional[str] = None,
+                                   content: Optional[str] = None, type: Optional[str] = None,
+                                   poll_options: Optional[str] = None,
+                                   expires_at: Optional[datetime] = None) -> bool:
+        """
+        Update an existing announcement.
+        
+        **Validates: Requirements 3.1**
+        
+        Args:
+            announcement_id: The announcement ID
+            title: New title (optional)
+            content: New content (optional)
+            type: New type (optional)
+            poll_options: New poll options (optional)
+            expires_at: New expiration (optional)
+            
+        Returns:
+            bool: True if updated, False if not found
+        """
+        # Build dynamic update query
+        updates = []
+        params = []
+        
+        if title is not None:
+            updates.append("title = $" + str(len(params) + 1) if self._use_postgres else "title = ?")
+            params.append(title)
+        if content is not None:
+            updates.append("content = $" + str(len(params) + 1) if self._use_postgres else "content = ?")
+            params.append(content)
+        if type is not None:
+            updates.append("type = $" + str(len(params) + 1) if self._use_postgres else "type = ?")
+            params.append(type)
+        if poll_options is not None:
+            updates.append("poll_options = $" + str(len(params) + 1) if self._use_postgres else "poll_options = ?")
+            params.append(poll_options)
+        if expires_at is not None:
+            updates.append("expires_at = $" + str(len(params) + 1) if self._use_postgres else "expires_at = ?")
+            if self._use_postgres:
+                params.append(expires_at.replace(tzinfo=None) if expires_at else None)
+            else:
+                params.append(expires_at.strftime('%Y-%m-%d %H:%M:%S') if expires_at else None)
+        
+        if not updates:
+            return False
+        
+        params.append(announcement_id)
+        
+        if self._use_postgres:
+            async with self._pool.acquire() as conn:
+                query = f"UPDATE announcements SET {', '.join(updates)} WHERE id = ${len(params)}"
+                result = await conn.execute(query, *params)
+                return result != "UPDATE 0"
+        else:
+            db = self._shared_conn if self._is_memory_db else await aiosqlite.connect(self.db_path)
+            try:
+                query = f"UPDATE announcements SET {', '.join(updates)} WHERE id = ?"
+                cursor = await db.execute(query, tuple(params))
+                await db.commit()
+                return cursor.rowcount > 0
+            finally:
+                if not self._is_memory_db:
+                    await db.close()
+
+    async def delete_announcement(self, announcement_id: int) -> bool:
+        """
+        Delete an announcement and its votes.
+        
+        **Validates: Requirements 3.1**
+        
+        Args:
+            announcement_id: The announcement ID
+            
+        Returns:
+            bool: True if deleted, False if not found
+        """
+        if self._use_postgres:
+            async with self._pool.acquire() as conn:
+                result = await conn.execute('''
+                    DELETE FROM announcements WHERE id = $1
+                ''', announcement_id)
+                return result != "DELETE 0"
+        else:
+            db = self._shared_conn if self._is_memory_db else await aiosqlite.connect(self.db_path)
+            try:
+                cursor = await db.execute('''
+                    DELETE FROM announcements WHERE id = ?
+                ''', (announcement_id,))
+                await db.commit()
+                return cursor.rowcount > 0
+            finally:
+                if not self._is_memory_db:
+                    await db.close()
+
+    # ==================== POLL VOTING ====================
+    
+    async def vote_on_poll(self, announcement_id: int, discord_id: str, selected_option: str) -> bool:
+        """
+        Vote on a poll announcement. Updates existing vote if user already voted.
+        
+        **Validates: Requirements 5.4**
+        
+        Args:
+            announcement_id: The poll announcement ID
+            discord_id: The voter's Discord ID
+            selected_option: The selected poll option
+            
+        Returns:
+            bool: True if vote was recorded/updated
+        """
+        if self._use_postgres:
+            async with self._pool.acquire() as conn:
+                # Upsert: insert or update on conflict
+                await conn.execute('''
+                    INSERT INTO announcement_votes (announcement_id, discord_id, selected_option)
+                    VALUES ($1, $2, $3)
+                    ON CONFLICT (announcement_id, discord_id) 
+                    DO UPDATE SET selected_option = $3, voted_at = CURRENT_TIMESTAMP
+                ''', announcement_id, discord_id, selected_option)
+                return True
+        else:
+            db = self._shared_conn if self._is_memory_db else await aiosqlite.connect(self.db_path)
+            try:
+                # SQLite upsert
+                await db.execute('''
+                    INSERT INTO announcement_votes (announcement_id, discord_id, selected_option)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT (announcement_id, discord_id) 
+                    DO UPDATE SET selected_option = excluded.selected_option, voted_at = CURRENT_TIMESTAMP
+                ''', (announcement_id, discord_id, selected_option))
+                await db.commit()
+                return True
+            finally:
+                if not self._is_memory_db:
+                    await db.close()
+
+    async def get_poll_results(self, announcement_id: int) -> Dict[str, int]:
+        """
+        Get vote counts for each option in a poll.
+        
+        **Validates: Requirements 5.3**
+        
+        Args:
+            announcement_id: The poll announcement ID
+            
+        Returns:
+            Dict mapping option -> vote count
+        """
+        if self._use_postgres:
+            async with self._pool.acquire() as conn:
+                rows = await conn.fetch('''
+                    SELECT selected_option, COUNT(*) as count
+                    FROM announcement_votes
+                    WHERE announcement_id = $1
+                    GROUP BY selected_option
+                ''', announcement_id)
+                return {row['selected_option']: row['count'] for row in rows}
+        else:
+            db = self._shared_conn if self._is_memory_db else await aiosqlite.connect(self.db_path)
+            try:
+                db.row_factory = aiosqlite.Row
+                cursor = await db.execute('''
+                    SELECT selected_option, COUNT(*) as count
+                    FROM announcement_votes
+                    WHERE announcement_id = ?
+                    GROUP BY selected_option
+                ''', (announcement_id,))
+                rows = await cursor.fetchall()
+                return {row['selected_option']: row['count'] for row in rows}
+            finally:
+                if not self._is_memory_db:
+                    await db.close()
+
+    async def get_user_vote(self, announcement_id: int, discord_id: str) -> Optional[str]:
+        """
+        Get a user's vote on a poll.
+        
+        Args:
+            announcement_id: The poll announcement ID
+            discord_id: The user's Discord ID
+            
+        Returns:
+            The selected option, or None if user hasn't voted
+        """
+        if self._use_postgres:
+            async with self._pool.acquire() as conn:
+                row = await conn.fetchrow('''
+                    SELECT selected_option FROM announcement_votes
+                    WHERE announcement_id = $1 AND discord_id = $2
+                ''', announcement_id, discord_id)
+                return row['selected_option'] if row else None
+        else:
+            db = self._shared_conn if self._is_memory_db else await aiosqlite.connect(self.db_path)
+            try:
+                cursor = await db.execute('''
+                    SELECT selected_option FROM announcement_votes
+                    WHERE announcement_id = ? AND discord_id = ?
+                ''', (announcement_id, discord_id))
+                row = await cursor.fetchone()
+                return row[0] if row else None
+            finally:
+                if not self._is_memory_db:
+                    await db.close()
+
+    # ==================== ANNOUNCEMENT REACTIONS ====================
+    
+    async def add_reaction(self, announcement_id: int, discord_id: str, emoji: str) -> bool:
+        """
+        Add an emoji reaction to an announcement.
+        
+        Args:
+            announcement_id: The announcement ID
+            discord_id: The user's Discord ID
+            emoji: The emoji character/string
+            
+        Returns:
+            True if reaction was added, False if already exists
+        """
+        if self._use_postgres:
+            async with self._pool.acquire() as conn:
+                try:
+                    await conn.execute('''
+                        INSERT INTO announcement_reactions (announcement_id, discord_id, emoji)
+                        VALUES ($1, $2, $3)
+                        ON CONFLICT (announcement_id, discord_id, emoji) DO NOTHING
+                    ''', announcement_id, discord_id, emoji)
+                    return True
+                except Exception as e:
+                    logger.error(f"Error adding reaction: {e}")
+                    return False
+        else:
+            db = self._shared_conn if self._is_memory_db else await aiosqlite.connect(self.db_path)
+            try:
+                await db.execute('''
+                    INSERT OR IGNORE INTO announcement_reactions (announcement_id, discord_id, emoji)
+                    VALUES (?, ?, ?)
+                ''', (announcement_id, discord_id, emoji))
+                await db.commit()
+                return True
+            except Exception as e:
+                logger.error(f"Error adding reaction: {e}")
+                return False
+            finally:
+                if not self._is_memory_db:
+                    await db.close()
+
+    async def remove_reaction(self, announcement_id: int, discord_id: str, emoji: str) -> bool:
+        """
+        Remove an emoji reaction from an announcement.
+        
+        Args:
+            announcement_id: The announcement ID
+            discord_id: The user's Discord ID
+            emoji: The emoji character/string
+            
+        Returns:
+            True if reaction was removed
+        """
+        if self._use_postgres:
+            async with self._pool.acquire() as conn:
+                result = await conn.execute('''
+                    DELETE FROM announcement_reactions
+                    WHERE announcement_id = $1 AND discord_id = $2 AND emoji = $3
+                ''', announcement_id, discord_id, emoji)
+                return 'DELETE' in result
+        else:
+            db = self._shared_conn if self._is_memory_db else await aiosqlite.connect(self.db_path)
+            try:
+                await db.execute('''
+                    DELETE FROM announcement_reactions
+                    WHERE announcement_id = ? AND discord_id = ? AND emoji = ?
+                ''', (announcement_id, discord_id, emoji))
+                await db.commit()
+                return True
+            finally:
+                if not self._is_memory_db:
+                    await db.close()
+
+    async def get_announcement_reactions(self, announcement_id: int) -> Dict[str, List[Dict[str, Any]]]:
+        """
+        Get all reactions for an announcement grouped by emoji.
+        
+        Args:
+            announcement_id: The announcement ID
+            
+        Returns:
+            Dict mapping emoji -> list of {discord_id, username, avatar}
+        """
+        if self._use_postgres:
+            async with self._pool.acquire() as conn:
+                rows = await conn.fetch('''
+                    SELECT ar.emoji, ar.discord_id, du.username, du.avatar, du.global_name
+                    FROM announcement_reactions ar
+                    LEFT JOIN discord_users du ON ar.discord_id = du.id
+                    WHERE ar.announcement_id = $1
+                    ORDER BY ar.reacted_at ASC
+                ''', announcement_id)
+                
+                reactions = {}
+                for row in rows:
+                    emoji = row['emoji']
+                    if emoji not in reactions:
+                        reactions[emoji] = []
+                    reactions[emoji].append({
+                        'discord_id': row['discord_id'],
+                        'username': row['global_name'] or row['username'] or 'Unknown',
+                        'avatar': row['avatar']
+                    })
+                return reactions
+        else:
+            db = self._shared_conn if self._is_memory_db else await aiosqlite.connect(self.db_path)
+            try:
+                db.row_factory = aiosqlite.Row
+                cursor = await db.execute('''
+                    SELECT ar.emoji, ar.discord_id, du.username, du.avatar, du.global_name
+                    FROM announcement_reactions ar
+                    LEFT JOIN discord_users du ON ar.discord_id = du.id
+                    WHERE ar.announcement_id = ?
+                    ORDER BY ar.reacted_at ASC
+                ''', (announcement_id,))
+                rows = await cursor.fetchall()
+                
+                reactions = {}
+                for row in rows:
+                    emoji = row['emoji']
+                    if emoji not in reactions:
+                        reactions[emoji] = []
+                    reactions[emoji].append({
+                        'discord_id': row['discord_id'],
+                        'username': row['global_name'] or row['username'] or 'Unknown',
+                        'avatar': row['avatar']
+                    })
+                return reactions
+            finally:
+                if not self._is_memory_db:
+                    await db.close()
+
+    async def get_user_reactions(self, announcement_id: int, discord_id: str) -> List[str]:
+        """
+        Get a user's reactions on an announcement.
+        
+        Args:
+            announcement_id: The announcement ID
+            discord_id: The user's Discord ID
+            
+        Returns:
+            List of emoji strings the user has reacted with
+        """
+        if self._use_postgres:
+            async with self._pool.acquire() as conn:
+                rows = await conn.fetch('''
+                    SELECT emoji FROM announcement_reactions
+                    WHERE announcement_id = $1 AND discord_id = $2
+                ''', announcement_id, discord_id)
+                return [row['emoji'] for row in rows]
+        else:
+            db = self._shared_conn if self._is_memory_db else await aiosqlite.connect(self.db_path)
+            try:
+                cursor = await db.execute('''
+                    SELECT emoji FROM announcement_reactions
+                    WHERE announcement_id = ? AND discord_id = ?
+                ''', (announcement_id, discord_id))
+                rows = await cursor.fetchall()
+                return [row[0] for row in rows]
+            finally:
+                if not self._is_memory_db:
+                    await db.close()
+
+
+    # ==================== USER DASHBOARD ====================
+    
+    async def get_user_dashboard_data(self, discord_id: str, logs_limit: int = 20) -> Optional[Dict[str, Any]]:
+        """
+        Get dashboard data for a logged-in user.
+        
+        **Validates: Requirements 2.2, 2.3, 2.4, 2.5**
+        
+        Args:
+            discord_id: The user's Discord ID
+            logs_limit: Maximum number of recent logs to return
+            
+        Returns:
+            Dashboard data including quota, stats, and recent logs
+        """
+        from datetime import timezone
+        
+        if self._use_postgres:
+            async with self._pool.acquire() as conn:
+                # Get user's sub-key
+                sub_key = await conn.fetchrow('''
+                    SELECT sk.*, du.username, du.avatar, du.global_name
+                    FROM sub_keys sk
+                    JOIN discord_users du ON sk.discord_id = du.id
+                    WHERE sk.discord_id = $1
+                    LIMIT 1
+                ''', discord_id)
+                
+                if not sub_key:
+                    return None
+                
+                sub_key_id = sub_key['id']
+                
+                # Calculate today's midnight UTC
+                now = datetime.now(timezone.utc)
+                today_midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+                next_midnight = today_midnight + timedelta(days=1)
+                today_midnight_naive = today_midnight.replace(tzinfo=None)
+                
+                # Get quota usage (sum of today's costs)
+                usage_row = await conn.fetchrow('''
+                    SELECT COALESCE(SUM(cost), 0) as total_cost
+                    FROM usage_logs 
+                    WHERE sub_key_id = $1 AND request_time >= $2
+                ''', sub_key_id, today_midnight_naive)
+                
+                daily_usage = float(usage_row['total_cost']) if usage_row else 0.0
+                daily_limit = float(sub_key['daily_dollar_limit'] or 20.0)
+                
+                # Get total request count
+                total_requests = await conn.fetchval('''
+                    SELECT COUNT(*) FROM usage_logs WHERE sub_key_id = $1
+                ''', sub_key_id)
+                
+                # Get top 5 models by usage count
+                top_models = await conn.fetch('''
+                    SELECT model, COUNT(*) as count
+                    FROM usage_logs
+                    WHERE sub_key_id = $1 AND model IS NOT NULL
+                    GROUP BY model
+                    ORDER BY count DESC
+                    LIMIT 5
+                ''', sub_key_id)
+                
+                # Get recent logs
+                recent_logs = await conn.fetch('''
+                    SELECT request_time, model, input_tokens, output_tokens, tokens_used, cost, client_app
+                    FROM usage_logs
+                    WHERE sub_key_id = $1
+                    ORDER BY request_time DESC
+                    LIMIT $2
+                ''', sub_key_id, logs_limit)
+                
+                # Build avatar URL
+                avatar_url = 'https://cdn.discordapp.com/embed/avatars/0.png'
+                if sub_key['avatar']:
+                    avatar_url = f"https://cdn.discordapp.com/avatars/{discord_id}/{sub_key['avatar']}.png"
+                
+                return {
+                    "user": {
+                        "discord_id": discord_id,
+                        "username": sub_key['global_name'] or sub_key['username'],
+                        "avatar_url": avatar_url,
+                        "sub_key_prefix": sub_key['sub_key_prefix']
+                    },
+                    "quota": {
+                        "used": daily_usage,
+                        "limit": daily_limit,
+                        "remaining": max(0, daily_limit - daily_usage),
+                        "reset_at": next_midnight.isoformat()
+                    },
+                    "stats": {
+                        "total_requests": total_requests or 0,
+                        "top_models": [{"model": row['model'], "count": row['count']} for row in top_models]
+                    },
+                    "recent_logs": [
+                        {
+                            "timestamp": row['request_time'].isoformat() if row['request_time'] else None,
+                            "model": row['model'],
+                            "input_tokens": row['input_tokens'] or 0,
+                            "output_tokens": row['output_tokens'] or 0,
+                            "tokens": row['tokens_used'] or 0,
+                            "cost": float(row['cost'] or 0),
+                            "client_app": row['client_app']
+                        }
+                        for row in recent_logs
+                    ]
+                }
+        else:
+            db = self._shared_conn if self._is_memory_db else await aiosqlite.connect(self.db_path)
+            try:
+                db.row_factory = aiosqlite.Row
+                
+                # Get user's sub-key
+                cursor = await db.execute('''
+                    SELECT sk.*, du.username, du.avatar, du.global_name
+                    FROM sub_keys sk
+                    JOIN discord_users du ON sk.discord_id = du.id
+                    WHERE sk.discord_id = ?
+                    LIMIT 1
+                ''', (discord_id,))
+                sub_key = await cursor.fetchone()
+                
+                if not sub_key:
+                    return None
+                
+                sub_key = dict(sub_key)
+                sub_key_id = sub_key['id']
+                
+                # Calculate today's midnight UTC
+                now = datetime.now(timezone.utc)
+                today_midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+                next_midnight = today_midnight + timedelta(days=1)
+                today_midnight_str = today_midnight.strftime('%Y-%m-%d %H:%M:%S')
+                
+                # Get quota usage
+                cursor = await db.execute('''
+                    SELECT COALESCE(SUM(cost), 0) as total_cost
+                    FROM usage_logs 
+                    WHERE sub_key_id = ? AND request_time >= ?
+                ''', (sub_key_id, today_midnight_str))
+                usage_row = await cursor.fetchone()
+                
+                daily_usage = float(usage_row['total_cost']) if usage_row else 0.0
+                daily_limit = float(sub_key['daily_dollar_limit'] or 20.0)
+                
+                # Get total request count
+                cursor = await db.execute('''
+                    SELECT COUNT(*) as count FROM usage_logs WHERE sub_key_id = ?
+                ''', (sub_key_id,))
+                count_row = await cursor.fetchone()
+                total_requests = count_row['count'] if count_row else 0
+                
+                # Get top 5 models
+                cursor = await db.execute('''
+                    SELECT model, COUNT(*) as count
+                    FROM usage_logs
+                    WHERE sub_key_id = ? AND model IS NOT NULL
+                    GROUP BY model
+                    ORDER BY count DESC
+                    LIMIT 5
+                ''', (sub_key_id,))
+                top_models = await cursor.fetchall()
+                
+                # Get recent logs
+                cursor = await db.execute('''
+                    SELECT request_time, model, input_tokens, output_tokens, tokens_used, cost, client_app
+                    FROM usage_logs
+                    WHERE sub_key_id = ?
+                    ORDER BY request_time DESC
+                    LIMIT ?
+                ''', (sub_key_id, logs_limit))
+                recent_logs = await cursor.fetchall()
+                
+                # Build avatar URL
+                avatar_url = 'https://cdn.discordapp.com/embed/avatars/0.png'
+                if sub_key['avatar']:
+                    avatar_url = f"https://cdn.discordapp.com/avatars/{discord_id}/{sub_key['avatar']}.png"
+                
+                return {
+                    "user": {
+                        "discord_id": discord_id,
+                        "username": sub_key['global_name'] or sub_key['username'],
+                        "avatar_url": avatar_url,
+                        "sub_key_prefix": sub_key['sub_key_prefix']
+                    },
+                    "quota": {
+                        "used": daily_usage,
+                        "limit": daily_limit,
+                        "remaining": max(0, daily_limit - daily_usage),
+                        "reset_at": next_midnight.isoformat()
+                    },
+                    "stats": {
+                        "total_requests": total_requests,
+                        "top_models": [{"model": row['model'], "count": row['count']} for row in top_models]
+                    },
+                    "recent_logs": [
+                        {
+                            "timestamp": row['request_time'],
+                            "model": row['model'],
+                            "input_tokens": row['input_tokens'] or 0,
+                            "output_tokens": row['output_tokens'] or 0,
+                            "tokens": row['tokens_used'] or 0,
+                            "cost": float(row['cost'] or 0),
+                            "client_app": row['client_app']
+                        }
+                        for row in recent_logs
+                    ]
+                }
             finally:
                 if not self._is_memory_db:
                     await db.close()
