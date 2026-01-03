@@ -1,0 +1,985 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MOI's Proxy</title>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        /* ===================================
+           Main Landing Page - Black & White Grid Theme
+           =================================== */
+        
+        :root {
+            --bg-primary: #0a0a0a;
+            --bg-secondary: #111111;
+            --grid-color: rgba(255, 255, 255, 0.06);
+            --grid-color-strong: rgba(255, 255, 255, 0.12);
+            --text-primary: #ffffff;
+            --text-secondary: rgba(255, 255, 255, 0.7);
+            --text-muted: rgba(255, 255, 255, 0.4);
+            --discord-blurple: #5865F2;
+            --discord-blurple-hover: #4752C4;
+            --font-mono: 'JetBrains Mono', 'Fira Code', monospace;
+            --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        html, body {
+            height: 100%;
+            overflow: hidden;
+        }
+
+        body {
+            font-family: var(--font-sans);
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            min-height: 100vh;
+        }
+
+        /* ===================================
+           Animated Grid Background
+           =================================== */
+        
+        .grid-background {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            z-index: 0;
+            overflow: hidden;
+        }
+
+        .grid-background::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background-image: 
+                linear-gradient(var(--grid-color) 1px, transparent 1px),
+                linear-gradient(90deg, var(--grid-color) 1px, transparent 1px);
+            background-size: 60px 60px;
+            animation: gridPulse 8s ease-in-out infinite;
+        }
+
+        .grid-background::after {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background-image: 
+                linear-gradient(var(--grid-color-strong) 1px, transparent 1px),
+                linear-gradient(90deg, var(--grid-color-strong) 1px, transparent 1px);
+            background-size: 300px 300px;
+        }
+
+        @keyframes gridPulse {
+            0%, 100% { opacity: 0.5; }
+            50% { opacity: 1; }
+        }
+
+        .grid-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: radial-gradient(ellipse at center, transparent 0%, var(--bg-primary) 70%);
+            z-index: 1;
+            pointer-events: none;
+        }
+
+        /* ===================================
+           Main Content Container
+           =================================== */
+        
+        .main-container {
+            position: relative;
+            z-index: 10;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            text-align: center;
+            padding: 2rem;
+            max-width: 700px;
+            width: 100%;
+        }
+
+        /* Logo Section */
+        .logo-section {
+            margin-bottom: 3rem;
+        }
+
+        .logo-icon {
+            width: 100px;
+            height: 100px;
+            border-radius: 24px;
+            overflow: hidden;
+            margin: 0 auto 1.5rem;
+            box-shadow: 0 8px 32px rgba(255, 255, 255, 0.1);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        .logo-icon img {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+        }
+
+        .logo-title {
+            font-size: 2.5rem;
+            font-weight: 700;
+            color: var(--text-primary);
+            letter-spacing: -0.02em;
+        }
+
+        /* ===================================
+           Typing Animation Container
+           =================================== */
+        
+        .typing-container {
+            min-height: 120px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin-bottom: 3rem;
+        }
+
+        .typing-text {
+            font-family: var(--font-mono);
+            font-size: 1.75rem;
+            font-weight: 600;
+            color: var(--text-primary);
+            line-height: 1.4;
+            letter-spacing: -0.01em;
+        }
+
+        .typing-cursor {
+            display: inline-block;
+            width: 3px;
+            height: 1.4em;
+            background: var(--text-primary);
+            margin-left: 4px;
+            vertical-align: text-bottom;
+            animation: cursorBlink 1s step-end infinite;
+        }
+
+        @keyframes cursorBlink {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0; }
+        }
+
+        /* ===================================
+           Discord Login Button
+           =================================== */
+        
+        .discord-btn {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 12px;
+            padding: 18px 40px;
+            background: var(--discord-blurple);
+            color: white;
+            border: none;
+            border-radius: 14px;
+            font-family: var(--font-sans);
+            font-size: 1.1rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            text-decoration: none;
+            box-shadow: 0 4px 20px rgba(88, 101, 242, 0.4);
+        }
+
+        .discord-btn:hover {
+            background: var(--discord-blurple-hover);
+            transform: translateY(-2px);
+            box-shadow: 0 8px 30px rgba(88, 101, 242, 0.5);
+        }
+
+        .discord-btn:active {
+            transform: translateY(0);
+        }
+
+        .discord-btn svg {
+            width: 26px;
+            height: 26px;
+            fill: currentColor;
+        }
+
+        /* ===================================
+           Secondary Links
+           =================================== */
+        
+        .secondary-links {
+            margin-top: 2rem;
+            display: flex;
+            gap: 2rem;
+        }
+
+        .secondary-link {
+            color: var(--text-muted);
+            text-decoration: none;
+            font-size: 0.9rem;
+            transition: color 0.2s ease;
+        }
+
+        .secondary-link:hover {
+            color: var(--text-secondary);
+        }
+
+        /* ===================================
+           User Info (when logged in)
+           =================================== */
+        
+        .user-info {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            padding: 12px 20px;
+            background: rgba(255, 255, 255, 0.05);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 12px;
+            margin-bottom: 1rem;
+        }
+
+        .user-avatar {
+            width: 36px;
+            height: 36px;
+            border-radius: 50%;
+            border: 2px solid rgba(255, 255, 255, 0.2);
+            object-fit: cover;
+            background-color: rgba(255, 255, 255, 0.1);
+        }
+
+        .user-name {
+            color: var(--text-primary);
+            font-weight: 500;
+            font-size: 0.95rem;
+        }
+
+        /* ===================================
+           Footer Note
+           =================================== */
+        
+        .footer-note {
+            position: fixed;
+            bottom: 2rem;
+            left: 50%;
+            transform: translateX(-50%);
+            font-size: 0.75rem;
+            color: var(--text-muted);
+            text-align: center;
+            z-index: 10;
+        }
+
+        .footer-note a {
+            color: var(--text-secondary);
+            text-decoration: none;
+            transition: color 0.2s ease;
+        }
+
+        .footer-note a:hover {
+            color: var(--text-primary);
+        }
+
+        /* ===================================
+           How to Set Up Button & Modal
+           =================================== */
+        
+        .setup-btn {
+            position: fixed;
+            top: 1.5rem;
+            right: 1.5rem;
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 10px 18px;
+            background: rgba(255, 255, 255, 0.08);
+            border: 1px solid rgba(255, 255, 255, 0.15);
+            border-radius: 10px;
+            color: var(--text-secondary);
+            font-family: var(--font-sans);
+            font-size: 0.9rem;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            z-index: 100;
+        }
+
+        .setup-btn:hover {
+            background: rgba(255, 255, 255, 0.12);
+            border-color: rgba(255, 255, 255, 0.25);
+            color: var(--text-primary);
+        }
+
+        .setup-btn svg {
+            width: 18px;
+            height: 18px;
+        }
+
+        /* Setup Modal */
+        .setup-modal-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.7);
+            backdrop-filter: blur(4px);
+            display: none;
+            align-items: center;
+            justify-content: center;
+            z-index: 1000;
+        }
+
+        .setup-modal-overlay.active {
+            display: flex;
+        }
+
+        .setup-modal {
+            background: var(--bg-secondary);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 16px;
+            max-width: 500px;
+            width: 90%;
+            max-height: 90vh;
+            overflow-y: auto;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
+        }
+
+        .setup-modal-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 1.25rem 1.5rem;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        .setup-modal-header h2 {
+            font-size: 1.25rem;
+            font-weight: 600;
+            color: var(--text-primary);
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .setup-modal-close {
+            background: none;
+            border: none;
+            color: var(--text-muted);
+            font-size: 1.5rem;
+            cursor: pointer;
+            padding: 4px;
+            line-height: 1;
+            transition: color 0.2s ease;
+        }
+
+        .setup-modal-close:hover {
+            color: var(--text-primary);
+        }
+
+        .setup-modal-body {
+            padding: 1.5rem;
+        }
+
+        .setup-item {
+            margin-bottom: 1.25rem;
+        }
+
+        .setup-item:last-child {
+            margin-bottom: 0;
+        }
+
+        .setup-item-label {
+            font-size: 0.85rem;
+            color: var(--text-muted);
+            margin-bottom: 0.5rem;
+            font-weight: 500;
+        }
+
+        .setup-item-url {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            background: rgba(255, 255, 255, 0.05);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 8px;
+            padding: 10px 12px;
+        }
+
+        .setup-item-url code {
+            flex: 1;
+            font-family: var(--font-mono);
+            font-size: 0.85rem;
+            color: var(--text-primary);
+            word-break: break-all;
+        }
+
+        .copy-btn {
+            background: rgba(255, 255, 255, 0.1);
+            border: none;
+            border-radius: 6px;
+            padding: 6px 10px;
+            color: var(--text-secondary);
+            cursor: pointer;
+            transition: all 0.2s ease;
+            display: flex;
+            align-items: center;
+            gap: 4px;
+            font-size: 0.75rem;
+            font-family: var(--font-sans);
+        }
+
+        .copy-btn:hover {
+            background: rgba(255, 255, 255, 0.15);
+            color: var(--text-primary);
+        }
+
+        .copy-btn.copied {
+            background: rgba(34, 197, 94, 0.2);
+            color: #22c55e;
+        }
+
+        .copy-btn svg {
+            width: 14px;
+            height: 14px;
+        }
+
+        .setup-divider {
+            height: 1px;
+            background: rgba(255, 255, 255, 0.1);
+            margin: 1.25rem 0;
+        }
+
+        .setup-game-link {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 12px 16px;
+            background: rgba(88, 101, 242, 0.1);
+            border: 1px solid rgba(88, 101, 242, 0.3);
+            border-radius: 10px;
+            text-decoration: none;
+            transition: all 0.2s ease;
+        }
+
+        .setup-game-link:hover {
+            background: rgba(88, 101, 242, 0.2);
+            border-color: rgba(88, 101, 242, 0.5);
+        }
+
+        .setup-game-link .game-icon {
+            font-size: 1.5rem;
+        }
+
+        .setup-game-link .game-text {
+            flex: 1;
+        }
+
+        .setup-game-link .game-title {
+            color: var(--text-primary);
+            font-weight: 600;
+            font-size: 0.95rem;
+        }
+
+        .setup-game-link .game-desc {
+            color: var(--text-muted);
+            font-size: 0.8rem;
+        }
+
+        .setup-game-link .game-arrow {
+            color: var(--text-muted);
+            font-size: 1.25rem;
+        }
+
+        @media (max-width: 767px) {
+            .setup-btn {
+                top: 1rem;
+                right: 1rem;
+                padding: 8px 14px;
+                font-size: 0.85rem;
+            }
+
+            .setup-modal {
+                max-width: 95%;
+                margin: 1rem;
+            }
+
+            .setup-modal-header {
+                padding: 1rem 1.25rem;
+            }
+
+            .setup-modal-body {
+                padding: 1.25rem;
+            }
+
+            .setup-item-url code {
+                font-size: 0.75rem;
+            }
+        }
+
+        /* ===================================
+           Mobile Responsiveness
+           =================================== */
+        
+        @media (max-width: 1024px) {
+            .main-container {
+                padding: 2rem 1.5rem;
+            }
+
+            .logo-section {
+                margin-bottom: 2.5rem;
+            }
+
+            .typing-container {
+                margin-bottom: 2.5rem;
+            }
+        }
+
+        @media (max-width: 767px) {
+            .main-container {
+                padding: 1.5rem 1rem;
+                max-width: 100%;
+            }
+
+            .logo-icon {
+                width: 80px;
+                height: 80px;
+                border-radius: 20px;
+            }
+
+            .logo-title {
+                font-size: 2rem;
+            }
+
+            .logo-section {
+                margin-bottom: 2rem;
+            }
+
+            .typing-text {
+                font-size: 1.25rem;
+                line-height: 1.5;
+            }
+
+            .typing-container {
+                min-height: 80px;
+                margin-bottom: 2rem;
+                padding: 0 0.5rem;
+            }
+
+            .discord-btn {
+                padding: 16px 32px;
+                font-size: 1rem;
+                width: 100%;
+                max-width: 320px;
+                min-height: 56px;
+                border-radius: 14px;
+            }
+
+            .discord-btn:hover {
+                transform: none;
+            }
+
+            .discord-btn:active {
+                transform: scale(0.98);
+                background: var(--discord-blurple-hover);
+            }
+
+            .secondary-links {
+                flex-direction: column;
+                gap: 1rem;
+            }
+
+            .grid-background::before {
+                background-size: 40px 40px;
+            }
+
+            .grid-background::after {
+                background-size: 200px 200px;
+            }
+
+            .footer-note {
+                bottom: 1.5rem;
+                font-size: 0.7rem;
+                padding: 0 1rem;
+            }
+        }
+
+        @media (max-width: 480px) {
+            .main-container {
+                padding: 1rem;
+            }
+
+            .logo-icon {
+                width: 64px;
+                height: 64px;
+                border-radius: 16px;
+            }
+
+            .logo-title {
+                font-size: 1.75rem;
+            }
+
+            .logo-section {
+                margin-bottom: 1.5rem;
+            }
+
+            .typing-text {
+                font-size: 1.1rem;
+            }
+
+            .typing-container {
+                min-height: 70px;
+                margin-bottom: 1.5rem;
+            }
+
+            .discord-btn {
+                padding: 14px 28px;
+                font-size: 0.95rem;
+                max-width: 280px;
+                min-height: 52px;
+            }
+
+            .footer-note {
+                bottom: 1rem;
+            }
+        }
+
+        /* Touch device optimizations */
+        @media (hover: none) and (pointer: coarse) {
+            .discord-btn:hover {
+                transform: none;
+                box-shadow: 0 4px 20px rgba(88, 101, 242, 0.4);
+            }
+
+            .discord-btn:active {
+                transform: scale(0.98);
+                background: var(--discord-blurple-hover);
+            }
+        }
+    </style>
+</head>
+<body>
+    <!-- Animated Grid Background -->
+    <div class="grid-background"></div>
+    <div class="grid-overlay"></div>
+
+    <!-- How to Set Up Button -->
+    <button class="setup-btn" onclick="openSetupModal()">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="12" r="10"></circle>
+            <path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"></path>
+            <line x1="12" y1="17" x2="12.01" y2="17"></line>
+        </svg>
+        How to Set Up
+    </button>
+
+    <!-- Setup Modal -->
+    <div class="setup-modal-overlay" id="setupModal" onclick="closeSetupModal(event)">
+        <div class="setup-modal" onclick="event.stopPropagation()">
+            <div class="setup-modal-header">
+                <h2>⚙️ Setup Guide</h2>
+                <button class="setup-modal-close" onclick="closeSetupModal()">&times;</button>
+            </div>
+            <div class="setup-modal-body">
+                <div class="setup-item">
+                    <div class="setup-item-label">Base URL</div>
+                    <div class="setup-item-url">
+                        <code id="baseUrl">https://moi.zeabur.app/v1</code>
+                        <button class="copy-btn" onclick="copyToClipboard('baseUrl', this)">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
+                                <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
+                            </svg>
+                            Copy
+                        </button>
+                    </div>
+                </div>
+
+                <div class="setup-item">
+                    <div class="setup-item-label">Chat Completions URL (for Janitor AI)</div>
+                    <div class="setup-item-url">
+                        <code id="chatUrl">https://moi.zeabur.app/v1/chat/completions</code>
+                        <button class="copy-btn" onclick="copyToClipboard('chatUrl', this)">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
+                                <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
+                            </svg>
+                            Copy
+                        </button>
+                    </div>
+                </div>
+
+                <div class="setup-divider"></div>
+
+                <div class="setup-item">
+                    <div class="setup-item-label">Earn API Keys</div>
+                    <a href="https://go-go-dancer.zeabur.app" target="_blank" rel="noopener noreferrer" class="setup-game-link">
+                        <span class="game-icon">🎮</span>
+                        <div class="game-text">
+                            <div class="game-title">Play the Game</div>
+                            <div class="game-desc">Earn keys by playing Go Go Dancer</div>
+                        </div>
+                        <span class="game-arrow">→</span>
+                    </a>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Main Content -->
+    <div class="main-container">
+        <!-- Logo Section -->
+        <div class="logo-section">
+            <div class="logo-icon">
+                <img src="https://i.etsystatic.com/43905133/r/isla/94ccff/64549231/isla_180x180.64549231_6dw9fw3s.jpg" alt="MOI's Proxy Logo">
+            </div>
+            <h1 class="logo-title">MOI's Proxy</h1>
+        </div>
+
+        <!-- Typing Animation -->
+        <div class="typing-container">
+            <p class="typing-text">
+                <span id="typingOutput"></span><span class="typing-cursor"></span>
+            </p>
+        </div>
+
+        <!-- Discord Login Button (shown when not logged in) -->
+        <a href="/auth/login" class="discord-btn" id="discordLoginBtn">
+            <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+                <path d="M20.317 4.37a19.791 19.791 0 0 0-4.885-1.515.074.074 0 0 0-.079.037c-.21.375-.444.864-.608 1.25a18.27 18.27 0 0 0-5.487 0 12.64 12.64 0 0 0-.617-1.25.077.077 0 0 0-.079-.037A19.736 19.736 0 0 0 3.677 4.37a.07.07 0 0 0-.032.027C.533 9.046-.32 13.58.099 18.057a.082.082 0 0 0 .031.057 19.9 19.9 0 0 0 5.993 3.03.078.078 0 0 0 .084-.028 14.09 14.09 0 0 0 1.226-1.994.076.076 0 0 0-.041-.106 13.107 13.107 0 0 1-1.872-.892.077.077 0 0 1-.008-.128 10.2 10.2 0 0 0 .372-.292.074.074 0 0 1 .077-.01c3.928 1.793 8.18 1.793 12.062 0a.074.074 0 0 1 .078.01c.12.098.246.198.373.292a.077.077 0 0 1-.006.127 12.299 12.299 0 0 1-1.873.892.077.077 0 0 0-.041.107c.36.698.772 1.362 1.225 1.993a.076.076 0 0 0 .084.028 19.839 19.839 0 0 0 6.002-3.03.077.077 0 0 0 .032-.054c.5-5.177-.838-9.674-3.549-13.66a.061.061 0 0 0-.031-.03zM8.02 15.33c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.956-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.956 2.418-2.157 2.418zm7.975 0c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.955-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.946 2.418-2.157 2.418z"/>
+            </svg>
+            Login with Discord
+        </a>
+
+        <!-- User Info (shown when logged in) -->
+        <div class="user-info" id="userInfo" style="display: none;">
+            <img src="https://cdn.discordapp.com/embed/avatars/0.png" alt="Avatar" class="user-avatar" id="userAvatar">
+            <span class="user-name" id="userName"></span>
+        </div>
+
+        <!-- Secondary Links -->
+        <div class="secondary-links">
+            <a href="/user-dashboard" class="secondary-link" id="myDashboardLink" style="display: none;">My Dashboard →</a>
+            <a href="/validator" class="secondary-link">API Key Validator →</a>
+            <a href="/admin" class="secondary-link">Admin Dashboard →</a>
+        </div>
+    </div>
+
+    <!-- Footer Note -->
+    <div class="footer-note">
+        <p>OpenAI-Compatible API Proxy</p>
+    </div>
+
+    <!-- Typing Animation Script -->
+    <script>
+        /**
+         * Typing Animation Class
+         * Types text character by character (0.4s per char), pauses 5s, deletes, waits 4s, loops
+         */
+        class TypingAnimation {
+            constructor(elementId, text, options = {}) {
+                this.element = document.getElementById(elementId);
+                this.text = text;
+                this.typingSpeed = options.typingSpeed || 400;      // 0.4 seconds per character
+                this.pauseDuration = options.pauseDuration || 5000; // 5 seconds pause after typing
+                this.deletingSpeed = options.deletingSpeed || 400;  // 0.4 seconds per character delete
+                this.restartDelay = options.restartDelay || 4000;   // 4 seconds before restart
+                this.isRunning = true;
+            }
+
+            async sleep(ms) {
+                return new Promise(resolve => setTimeout(resolve, ms));
+            }
+
+            async typeText() {
+                for (let i = 0; i <= this.text.length && this.isRunning; i++) {
+                    this.element.textContent = this.text.substring(0, i);
+                    await this.sleep(this.typingSpeed);
+                }
+            }
+
+            async deleteText() {
+                for (let i = this.text.length; i >= 0 && this.isRunning; i--) {
+                    this.element.textContent = this.text.substring(0, i);
+                    await this.sleep(this.deletingSpeed);
+                }
+            }
+
+            async animate() {
+                while (this.isRunning) {
+                    // Type the text (0.4s per character)
+                    await this.typeText();
+                    
+                    // Pause for 5 seconds after typing completes
+                    await this.sleep(this.pauseDuration);
+                    
+                    // Delete the text character by character (0.4s per character)
+                    await this.deleteText();
+                    
+                    // Wait 4 seconds before restarting
+                    await this.sleep(this.restartDelay);
+                }
+            }
+
+            stop() {
+                this.isRunning = false;
+            }
+        }
+
+        // Initialize typing animation on page load
+        document.addEventListener('DOMContentLoaded', () => {
+            const typingAnimation = new TypingAnimation(
+                'typingOutput',
+                'Please log in with Discord',
+                {
+                    typingSpeed: 400,      // 0.4 seconds per character
+                    pauseDuration: 5000,   // 5 seconds pause
+                    deletingSpeed: 400,    // 0.4 seconds per character
+                    restartDelay: 4000     // 4 seconds before restart
+                }
+            );
+            
+            // Start the animation loop
+            typingAnimation.animate();
+            
+            // Check if user is logged in
+            checkDiscordAuth();
+        });
+
+        /**
+         * Check if user is logged in with Discord and update UI accordingly
+         */
+        async function checkDiscordAuth() {
+            try {
+                const response = await fetch('/api/auth/me');
+                if (response.ok) {
+                    const userData = await response.json();
+                    
+                    // User is logged in - hide login button, show user info and My Dashboard link
+                    const loginBtn = document.getElementById('discordLoginBtn');
+                    const userInfo = document.getElementById('userInfo');
+                    const userAvatar = document.getElementById('userAvatar');
+                    const userName = document.getElementById('userName');
+                    const myDashboardLink = document.getElementById('myDashboardLink');
+                    
+                    if (loginBtn) {
+                        loginBtn.style.display = 'none';
+                    }
+                    
+                    if (userInfo && userData) {
+                        userInfo.style.display = 'flex';
+                        
+                        // Set avatar - use avatar_url from API if available
+                        if (userAvatar) {
+                            if (userData.avatar_url) {
+                                userAvatar.src = userData.avatar_url;
+                            } else if (userData.avatar && userData.id) {
+                                userAvatar.src = `https://cdn.discordapp.com/avatars/${userData.id}/${userData.avatar}.png`;
+                            } else {
+                                // Default avatar
+                                const defaultIndex = userData.id ? (parseInt(userData.id) % 5) : 0;
+                                userAvatar.src = `https://cdn.discordapp.com/embed/avatars/${defaultIndex}.png`;
+                            }
+                            // Handle image load errors
+                            userAvatar.onerror = function() {
+                                this.onerror = null;
+                                this.src = 'https://cdn.discordapp.com/embed/avatars/0.png';
+                            };
+                        }
+                        
+                        // Set username
+                        if (userName) {
+                            userName.textContent = userData.global_name || userData.username || 'User';
+                        }
+                    }
+                    
+                    // Show My Dashboard link
+                    if (myDashboardLink) {
+                        myDashboardLink.style.display = 'inline';
+                    }
+                } else {
+                    // Not logged in - show login button, hide user info and My Dashboard link
+                    const loginBtn = document.getElementById('discordLoginBtn');
+                    const userInfo = document.getElementById('userInfo');
+                    const myDashboardLink = document.getElementById('myDashboardLink');
+                    
+                    if (loginBtn) {
+                        loginBtn.style.display = 'inline-flex';
+                    }
+                    if (userInfo) {
+                        userInfo.style.display = 'none';
+                    }
+                    if (myDashboardLink) {
+                        myDashboardLink.style.display = 'none';
+                    }
+                }
+            } catch (error) {
+                // Not logged in or error - keep login button visible
+                console.log('Discord auth check: not logged in');
+            }
+        }
+
+        /**
+         * Setup Modal Functions
+         */
+        function openSetupModal() {
+            document.getElementById('setupModal').classList.add('active');
+        }
+
+        function closeSetupModal(event) {
+            if (!event || event.target === document.getElementById('setupModal')) {
+                document.getElementById('setupModal').classList.remove('active');
+            }
+        }
+
+        async function copyToClipboard(elementId, button) {
+            const text = document.getElementById(elementId).textContent;
+            try {
+                await navigator.clipboard.writeText(text);
+                
+                // Visual feedback
+                const originalText = button.innerHTML;
+                button.classList.add('copied');
+                button.innerHTML = `
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <polyline points="20 6 9 17 4 12"></polyline>
+                    </svg>
+                    Copied!
+                `;
+                
+                setTimeout(() => {
+                    button.classList.remove('copied');
+                    button.innerHTML = originalText;
+                }, 2000);
+            } catch (err) {
+                console.error('Failed to copy:', err);
+            }
+        }
+
+        // Close modal on Escape key
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape') {
+                closeSetupModal();
+            }
+        });
+    </script>
+</body>
+</html>
